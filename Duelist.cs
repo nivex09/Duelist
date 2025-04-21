@@ -29,7 +29,7 @@ Changed autoready to not be removed except when toggled off with /duel autoready
 
 namespace Oxide.Plugins
 {
-    [Info("Duelist", "nivex", "1.3.511")]
+    [Info("Duelist", "nivex", "1.3.512")]
     [Description("1v1 and team deathmatch event.")]
     public class Duelist : RustPlugin
     {
@@ -833,7 +833,7 @@ namespace Oxide.Plugins
                     }
 
                     using var good = GetPool(_good);
-                    
+
                     foreach (var player in good)
                     {
                         RemoveMatchPlayer(player);
@@ -884,7 +884,7 @@ namespace Oxide.Plugins
 
                 foreach (var player in players)
                 {
-                    if (IsNull(player)) 
+                    if (IsNull(player))
                         continue;
 
                     if (player.inventory.containerWear.HasFlag(ItemContainer.Flag.IsLocked))
@@ -902,7 +902,7 @@ namespace Oxide.Plugins
                         env.Track(player, false);
                     }
                 }
-                
+
                 _good.Clear();
                 _evil.Clear();
                 env.tdmMatches.Remove(this);
@@ -1350,7 +1350,7 @@ namespace Oxide.Plugins
                 float y = TerrainMeta.HeightMap.GetHeight(target);
                 float w = TerrainMeta.WaterMap.GetHeight(target);
                 float p = TerrainMeta.HighestPoint.y + 250f;
-                
+
                 if (Physics.Raycast(new Vector3(target.x, w, target.z), Vector3.up, out var hit, p, Layers.Mask.World))
                 {
                     y = Mathf.Max(y, hit.point.y);
@@ -2160,7 +2160,7 @@ namespace Oxide.Plugins
                 if (dcsBlock.Contains(victimId))
                     return;
             }
-            
+
             if (attacker != null)
             {
                 if (victim.IsConnected && attacker.IsConnected)
@@ -2586,7 +2586,7 @@ namespace Oxide.Plugins
 
                 if (!duelEntities.TryGetValue(entity.OwnerID, out var entities2))
                     duelEntities.Add(entity.OwnerID, entities2 = new());
-                
+
                 entities2.Add(entity);
             }
 
@@ -3699,7 +3699,8 @@ namespace Oxide.Plugins
                             {
                                 if (player.Distance(pos) > 1000f) continue;
                                 player.SendConsoleCommand("ddraw.text", 30f, Color.green, pos, "X");
-                            };
+                            }
+                            ;
                         }
                         return;
                     }
@@ -3857,7 +3858,7 @@ namespace Oxide.Plugins
                                         break;
                                     }
                                 }
-                                
+
                                 var _nameArgs = args.Where(arg => arg.ToLower() != "tp" && arg != radius.ToString());
                                 var name = _nameArgs.Count() > 0 ? string.Join(" ", _nameArgs) : null;
                                 var zone = SetupDuelZone(hit.point, null, GetZoneName(name, radius));
@@ -5981,7 +5982,8 @@ namespace Oxide.Plugins
                 }
 
                 zones.Remove(zone);
-            };
+            }
+            ;
 
             return false;
         }
@@ -6009,13 +6011,22 @@ namespace Oxide.Plugins
             if (Kits.CanCall())
             {
                 using var kits = GetPool(lpDuelingKits, hpDuelingKits);
+                using var remove = GetPool<string>();
                 foreach (string kit in kits)
                 {
                     if (!IsKit(kit))
                     {
-                        lpDuelingKits.Remove(kit);
-                        hpDuelingKits.Remove(kit);
+                        remove.Add(kit);
                     }
+                }
+                if (kits.Count == remove.Count)
+                {
+                    return;
+                }
+                foreach (string kit in remove)
+                {
+                    lpDuelingKits.Remove(kit);
+                    hpDuelingKits.Remove(kit);
                 }
             }
         }
@@ -6237,7 +6248,7 @@ namespace Oxide.Plugins
                     return true;
                 }
             }
-            
+
             return false;
         }
 
@@ -7615,7 +7626,7 @@ namespace Oxide.Plugins
             }
         }
 
-        private static Dictionary<string, List<DuelKitItem>> customKits = new();
+        private Dictionary<string, List<DuelKitItem>> customKits = new();
 
         private Dictionary<string, object> DefaultCustomKits
         {
