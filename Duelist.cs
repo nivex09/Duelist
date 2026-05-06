@@ -1,26 +1,36 @@
-﻿using System;
-using System.Collections;
-using System.Collections.Generic;
-using System.IO;
-using System.Text.RegularExpressions;
-using Facepunch;
+﻿using Facepunch;
+using Facepunch.Extend;
+using Network;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using Oxide.Core;
-using Oxide.Core.Configuration;
 using Oxide.Core.Libraries.Covalence;
 using Oxide.Core.Plugins;
+using Oxide.Game.Rust;
 using Oxide.Game.Rust.Cui;
 using Oxide.Game.Rust.Libraries;
-using Oxide.Plugins.DuelistExtensionMethods;
 using Rust;
+using Rust.Ai.Gen2;
 using Rust.Workshop;
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Text;
+using System.Text.RegularExpressions;
 using UnityEngine;
+using static Oxide.Plugins.DuelistExtensionMethods.ExtensionMethods;
 using Random = UnityEngine.Random;
 
 /*
 https://umod.org/community/duelist/55337-dueling-dome?page=1#post-7
 https://umod.org/community/duelist/55959-dueling-ideas
+https://umod.org/community/duelist/50367-the-ability-to-place-bets-in-the-economy-or-server-rewards?page=1#post-4
 
+priority: https://umod.org/community/duelist/56195-kit-gui-on-duel-start?page=1#post-4
+
+Fixed barricades not despawning
 Fixed support for Economics
 Fixed `Create New Zone Every X Duels`
 Rewrote zone creation
@@ -29,75 +39,128 @@ Changed autoready to not be removed except when toggled off with /duel autoready
 
 namespace Oxide.Plugins
 {
-    [Info("Duelist", "nivex", "1.3.512")]
+    [Info("Duelist", "nivex", "1.3.555")]
     [Description("1v1 and team deathmatch event.")]
     public class Duelist : RustPlugin
     {
-        [PluginReference] Plugin Kits, ZoneManager, Economics, ServerRewards, Clans, AimTrain, LustyMap;
+        [PluginReference] Plugin Kits, KitController, ZoneManager, Clans, AimTrain, LustyMap;
 
-        private static Duelist Instance;
-
-        public enum Team { Good = 0, Evil = 1, None = 2 }
         private const string hewwPrefab = "assets/prefabs/building/wall.external.high.wood/wall.external.high.wood.prefab";
         private const string heswPrefab = "assets/prefabs/building/wall.external.high.stone/wall.external.high.stone.prefab";
         private const bool debugMode = false;
+        private const ulong DUELIST_ID = 628944326;
+        private const int blockedMask = Layers.Mask.Player_Server | Layers.Mask.Construction | Layers.Mask.Deployed; // layers we won't be setting a zone within 50 meters of
+        private const int constructionMask = Layers.Mask.Construction | Layers.Mask.Deployed;
+        private const int groundMask = Layers.Mask.Terrain | Layers.Mask.World | Layers.Mask.Default; // used to find dueling zone/set custom zone and create spawn points
+        private const int wallMask = Layers.Mask.Terrain | Layers.Mask.World | Layers.Mask.Default | Layers.Mask.Construction | Layers.Mask.Deployed;
+        private const int worldMask = 8454145; 
+        private bool matchUpdateRequired;
+        private bool resetDuelists; // if wipe is detected then assign awards and wipe VictoriesSeed / LossesSeed
+        private readonly List<BasePlayer> _emptyPlayers = new();
+        private List<ulong> _times = new();
+        private List<string> _suicide = new(); // users blocked from 1v1 for 60 seconds after suiciding or disconnecting
+        private List<string> _disconnected = new(); // users blocked from 1v1 for 60 seconds after suiciding or disconnecting
         private List<string> readyUiList = new();
-        private List<string> spectators = new();
         private List<Rematch> rematches = new();
+        private List<DuelingZone> duelingZones = new();
+        private HashSet<string> spectators = new();
+        private HashSet<GoodVersusEvilMatch> tdmMatches = new();
+        private Dictionary<string, ItemDefinition> _deployables = new();
+        private Dictionary<string, EscapedEventTracker> _trackers = new(); 
         private Dictionary<string, AttackerInfo> tdmAttackers = new();
         private Dictionary<string, string> tdmKits = new();
-        private HashSet<GoodVersusEvilMatch> tdmMatches = new();
-        private List<DuelingZone> duelingZones = new();
-        private StoredData duelsData = new();
-        private Dictionary<string, string> dataDuelists = new(); // active duelers
-        private Dictionary<string, long> dataImmunity = new(); // players immune to damage
-        private Dictionary<string, Vector3> dataImmunitySpawns = new(); // players spawn points
-        private int blockedMask = LayerMask.GetMask("Player (Server)", "Prevent Building", "Construction", "Deployed", "Trigger"); // layers we won't be setting a zone within 50 meters of
-        private int constructionMask = LayerMask.GetMask("Construction", "Deployed");
-        private bool matchUpdateRequired;
-        private int groundMask = LayerMask.GetMask("Terrain", "World", "Default"); // used to find dueling zone/set custom zone and create spawn points
-        private int wallMask = LayerMask.GetMask("Terrain", "World", "Default", "Construction", "Deployed");
-        private int worldMask = LayerMask.GetMask("World");
-        private Timer announceTimer;
-        private SortedDictionary<string, string> boneTags = new() { ["r_"] = "Right ", ["l_"] = "Left ", [".prefab"] = string.Empty, ["1"] = string.Empty, ["2"] = string.Empty, ["3"] = string.Empty, ["4"] = string.Empty, ["END"] = string.Empty, ["_"] = " ", ["."] = " " };
+        private Dictionary<string, PlayerData> _duelists = new(); // active duelers
+        private Dictionary<string, PlayerData> _immune = new(); // players immune to damage, and spawn point
         private Dictionary<string, string> announcements = new(); // users id and announcement
-        private Dictionary<string, long> dataDeath = new(); // users id and timestamp of when they're to be executed
-        private Dictionary<string, string> dataRequests = new(); // users requesting a duel and to whom
-        private Dictionary<string, bool> deployables = new();
+        private Dictionary<string, float> dataDeath = new(); // users id and timestamp of when they're to be executed
+        private Dictionary<PlayerData, PlayerData> dataRequests = new(); // users requesting a duel and to whom
         private Dictionary<ulong, List<BaseEntity>> duelEntities = new();
-        private DynamicConfigFile duelsFile;
-        private Timer eventTimer; // timer to check for immunity and auto death time of duelers
-        private Timer matchTimer; // timer to check for updates to the match ui
-        private Dictionary<Vector3, float> managedZones = new(); // blocked zones from zonemanager plugin
-        private List<Vector3> monuments = new(); // positions of monuments on the server
+        private Dictionary<string, DuelingZone> playerZones = new(); // id, set zone name
+        private Dictionary<string, ZoneManagerInfo> ManagedZones = new(); // blocked zones from zonemanager plugin
+        private Dictionary<Vector3, float> monuments = new(); // positions of monuments on the server
         private Dictionary<string, string> prefabs = new();
-        private bool resetDuelists; // if wipe is detected then assign awards and wipe VictoriesSeed / LossesSeed
         private Dictionary<string, List<ulong>> skinsCache = new(); // used to randomize custom kit skins which skin id values are 0
         private Dictionary<string, string> tdmRequests = new(); // users requesting a deathmatch and to whom
-        private Dictionary<string, List<ulong>> workshopskinsCache = new();
-        private List<string> dcsBlock = new(); // users blocked from 1v1 for 60 seconds after suiciding or disconnecting
-        private Dictionary<string, string> playerZones = new(); // id, set zone name
+        private SortedDictionary<long, PlayerData> Queued = new(); // queued duelers sorted by timestamp and user id. first come first serve
+        private StoredData data = new();
+        private Timer announceTimer;
+        private Timer eventTimer; // timer to check for immunity and auto death time of duelers
+        private Timer matchTimer; // timer to check for updates to the match ui
+
+        // 8 flat‑plane directions: N, NE, …, NW
+        private readonly Vector3[] Dir8 =
+        {
+            Vector3.forward, (Vector3.forward + Vector3.right).normalized,
+            Vector3.right, (Vector3.right + Vector3.back).normalized,
+            Vector3.back, (Vector3.back + Vector3.left).normalized,
+            Vector3.left, (Vector3.left + Vector3.forward).normalized
+        };
+
+        public enum Points { MatchVictory, MatchVictorySeed, MatchLoss, MatchLossSeed, MatchDeath, MatchDeathSeed, MatchKill, MatchKillSeed, Victory, VictorySeed, Loss, LossSeed, MatchSizeVictory, MatchSizeVictorySeed, MatchSizeLoss, MatchSizeLossSeed }
+
+        public enum Team { Good = 0, Evil = 1, None = 2 }
+
+        public enum SelectionResult { Initiate, Full, PaymentRequired }
+
+        public class AttackerInfo
+        {
+            public string AttackerName = string.Empty;
+            public string AttackerId = string.Empty;
+            public string BoneName = string.Empty;
+            public string Distance = string.Empty;
+            public string Weapon = string.Empty;
+            public ItemDefinition def;
+        }
+
+        public class PlayerData : IEquatable<PlayerData>
+        {
+            public float Time;
+            public string ID;
+            public string Name;
+            public Vector3 Spawn;
+            public BasePlayer Player;
+            public BasePlayer GetPlayer()
+            {
+                if (Player == null)
+                {
+                    using var targets = GetPlayerList();
+                    foreach (var player in targets)
+                    {
+                        if (player.UserIDString == ID)
+                        {
+                            Player = player;
+                            break;
+                        }
+                    }
+                }
+                return Player;
+            }
+            public PlayerData(BasePlayer player, float time = 0, Vector3 spawn = default)
+            {
+                Spawn = spawn;
+                ID = player.UserIDString;
+                Name = player.displayName;
+                Player = player;
+                Time = time;
+            }
+            public bool Equals(PlayerData other) => other != null && ID == other.ID;
+            public override bool Equals(object obj) => obj is PlayerData data && Equals(data);
+            public override int GetHashCode() => ID.GetHashCode();
+        }
 
         public class StoredData
         {
             public List<string> Allowed = new(); // list of users that allow duel requests
-            public Dictionary<string, List<string>> AutoGeneratedSpawns = new();
+            public List<string> Chat = new(); // user ids of those who opted out of seeing duel death messages
+            public List<string> ChatEx = new(); // user ids of those who opted to see duel death messages when the config blocks them for all players
+            public List<string> Restricted = new(); // list of users blocked from requesting a duel for 60 seconds
+            public List<string> AutoReady = new(); 
             public Dictionary<string, string> Bans = new(); // users banned from dueling
             public Dictionary<string, BetInfo> Bets = new(); // active bets users have placed
             public Dictionary<string, List<string>> BlockedUsers = new(); // users and the list of players they blocked from requesting duels with
-            public List<string> Chat = new(); // user ids of those who opted out of seeing duel death messages
-            public List<string> ChatEx = new(); // user ids of those who opted to see duel death messages when the config blocks them for all players
             public Dictionary<string, List<BetInfo>> ClaimBets = new(); // active bets users need to claim after winning a bet
             public Dictionary<string, string> CustomKits = new(); // userid and custom kit
-            public bool DuelsEnabled; // enable/disable dueling for all players (not admins)
-            public Dictionary<string, string> Homes = new(); // user id and location of where they teleported from
             public Dictionary<string, string> Kits = new(); // userid and kit. give kit when they wake up inside of the dueling zone
-            public Dictionary<string, int> Losses = new(); // user id / losses for lifetime
-            public Dictionary<string, int> LossesSeed = new(); // user id / losses for seed
-            public SortedDictionary<long, string> Queued = new(); // queued duelers sorted by timestamp and user id. first come first serve
-            public List<string> Restricted = new(); // list of users blocked from requesting a duel for 60 seconds
-            public List<string> Spawns = new(); // custom spawn points
-            public List<string> AutoReady = new();
             public Dictionary<string, int> MatchVictories = new(); // player name & total wins
             public Dictionary<string, int> MatchVictoriesSeed = new(); // player name & wins for current seed
             public Dictionary<string, int> MatchLosses = new(); // player name & total losses
@@ -106,86 +169,408 @@ namespace Oxide.Plugins
             public Dictionary<string, int> MatchDeathsSeed = new(); // player name & deaths for the seed
             public Dictionary<string, int> MatchKills = new(); // player name & total kills
             public Dictionary<string, int> MatchKillsSeed = new(); // player name & kills for current seed
-            public Dictionary<string, Dictionary<string, int>> MatchSizesVictories = new(); // size, id, wins
-            public Dictionary<string, Dictionary<string, int>> MatchSizesVictoriesSeed = new(); // size, id, wins seed
-            public Dictionary<string, Dictionary<string, int>> MatchSizesLosses = new(); // size, id, losses
-            public Dictionary<string, Dictionary<string, int>> MatchSizesLossesSeed = new(); // size, id, losses seed
-            public int TotalDuels; // the total amount of duels ever played on the server
             public Dictionary<string, int> Victories = new(); // user id / wins for lifetime
             public Dictionary<string, int> VictoriesSeed = new(); // user id / wins for seed
-            public Dictionary<string, DuelZone> Zones = new(); // location, name
+            public Dictionary<string, int> Losses = new(); // user id / losses for lifetime
+            public Dictionary<string, int> LossesSeed = new(); // user id / losses for seed
+            public Dictionary<int, Dictionary<string, int>> MatchSizesVictories = new(); // size, id, wins
+            public Dictionary<int, Dictionary<string, int>> MatchSizesVictoriesSeed = new(); // size, id, wins seed
+            public Dictionary<int, Dictionary<string, int>> MatchSizesLosses = new(); // size, id, losses
+            public Dictionary<int, Dictionary<string, int>> MatchSizesLossesSeed = new(); // size, id, losses seed
+
+            [JsonConverter(typeof(UnityVector3Converter))]
+            public List<Vector3> Spawns = new(); // custom spawn points
+
+            [JsonConverter(typeof(UnityVector3Converter))]
+            public Dictionary<Vector3, List<Vector3>> AutoGeneratedSpawns = new();
+
+            [JsonConverter(typeof(UnityVector3Converter))]
+            public Dictionary<string, Vector3> Homes = new(); // user id and location of where they teleported from
+
+            [JsonConverter(typeof(UnityVector3Converter))]
+            public Dictionary<Vector3, DuelZoneInfo> Zones = new(); // location, name
+
+            public bool DuelsEnabled; // enable/disable dueling for all players (not admins)
+            public int TotalDuels; // the total amount of duels ever played on the server
+
+            public int Add(string userid, Points points, int matchSize)
+            {
+                if (!userid.IsSteamId())
+                    return 1;
+
+                Dictionary<int, Dictionary<string, int>> dict = GetSize(points);
+
+                Dictionary<string, int> inner = dict.GetOrCreate(matchSize);
+
+                return inner[userid] = inner.GetOrCreate(userid) + 1;
+            }
+
+            public int Add(string userid, Points points)
+            {
+                if (!userid.IsSteamId())
+                    return 1;
+
+                Dictionary<string, int> dict = points switch
+                {
+                    Points.MatchVictory => MatchVictories,
+                    Points.MatchVictorySeed => MatchVictoriesSeed,
+                    Points.MatchLoss => MatchLosses,
+                    Points.MatchLossSeed => MatchLossesSeed,
+                    Points.MatchDeath => MatchDeaths,
+                    Points.MatchDeathSeed => MatchDeathsSeed,
+                    Points.MatchKill => MatchKills,
+                    Points.MatchKillSeed => MatchKillsSeed,
+                    Points.Victory => Victories,
+                    Points.VictorySeed => VictoriesSeed,
+                    Points.Loss => Losses,
+                    Points.LossSeed or _ => LossesSeed
+                };
+
+                return dict[userid] = dict.GetOrCreate(userid) + 1;
+            }
+
+            public Dictionary<string, int> Get(Points points)
+            {
+                return points switch
+                {
+                    Points.MatchVictory => MatchVictories,
+                    Points.MatchVictorySeed => MatchVictoriesSeed,
+                    Points.MatchLoss => MatchLosses,
+                    Points.MatchLossSeed => MatchLossesSeed,
+                    Points.MatchDeath => MatchDeaths,
+                    Points.MatchDeathSeed => MatchDeathsSeed,
+                    Points.MatchKill => MatchKills,
+                    Points.MatchKillSeed => MatchKillsSeed,
+                    Points.Victory => Victories,
+                    Points.VictorySeed => VictoriesSeed,
+                    Points.Loss => Losses,
+                    Points.LossSeed or _ => LossesSeed,
+                };
+            }
+
+            public Dictionary<int, Dictionary<string, int>> GetSize(Points points)
+            {
+                return points switch
+                {
+                    Points.MatchSizeVictory => MatchSizesVictories,
+                    Points.MatchSizeVictorySeed => MatchSizesVictoriesSeed,
+                    Points.MatchSizeLoss => MatchSizesLosses,
+                    Points.MatchSizeLossSeed or _ => MatchSizesLossesSeed,
+                };
+            }
+
+            public int Get(string userid, Points points)
+            {
+                if (!userid.IsSteamId())
+                    return UnityEngine.Random.Range(0, 16);
+
+                return Get(points).TryGetValue(userid, out int value) ? value : 0;
+            }
+
+            public int Get(string userid, Points points, int matchSize)
+            {
+                if (!userid.IsSteamId())
+                    return 0;
+
+                Dictionary<int, Dictionary<string, int>> dict = GetSize(points);
+
+                if (!dict.TryGetValue(matchSize, out var inner))
+                    return 0;
+
+                return inner.TryGetValue(userid, out int value) ? value : 0;
+            }
+
+            public void ResetSeed()
+            {
+                LossesSeed.Clear();
+                VictoriesSeed.Clear();
+                MatchKillsSeed.Clear();
+                MatchDeathsSeed.Clear();
+                MatchLossesSeed.Clear();
+                MatchVictoriesSeed.Clear();
+                MatchSizesVictoriesSeed.Clear();
+                MatchSizesLossesSeed.Clear();
+            }
         }
 
-        public class DuelZone
+        public class UnityVector3Converter : JsonConverter
+        {
+            private static string FormatS(Vector3 v)
+            {
+                return FormattableString.Invariant($"{v.x:0.###} {v.y:0.###} {v.z:0.###}");
+            }
+
+            private static string Format(Vector3 v)
+            {
+                return FormattableString.Invariant($"{v.x:R} {v.y:R} {v.z:R}");
+            }
+
+            private static Vector3 Parse(string s)
+            {
+                var parts = s.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                return new(Convert.ToSingle(parts[0], CultureInfo.InvariantCulture), Convert.ToSingle(parts[1], CultureInfo.InvariantCulture), Convert.ToSingle(parts[2], CultureInfo.InvariantCulture));
+            }
+
+            private static Vector3 Parse(JObject o)
+            {
+                return new(Convert.ToSingle(o["x"], CultureInfo.InvariantCulture), Convert.ToSingle(o["y"], CultureInfo.InvariantCulture), Convert.ToSingle(o["z"], CultureInfo.InvariantCulture));
+            }
+
+            public override bool CanConvert(Type objectType)
+            {
+                return objectType == typeof(Vector3)
+                    || objectType == typeof(List<Vector3>)
+                    || objectType == typeof(Dictionary<string, Vector3>)
+                    || objectType == typeof(Dictionary<string, List<Vector3>>)
+                    || objectType == typeof(Dictionary<string, DuelZoneInfo>)
+                    || objectType == typeof(Dictionary<Vector3, DuelZoneInfo>)
+                    || objectType == typeof(Dictionary<Vector3, List<Vector3>>);
+            }
+
+            public override void WriteJson(JsonWriter writer, object value, JsonSerializer serializer)
+            {
+                if (value is Vector3 v)
+                {
+                    if (!v.IsNaNOrInfinity())
+                    {
+                        writer.WriteValue(Format(v));
+                    }
+                    return;
+                }
+
+                if (value is IEnumerable<Vector3> vecList)
+                {
+                    writer.WriteStartArray();
+                    foreach (var vec in vecList)
+                    {
+                        if (vec.IsNaNOrInfinity()) continue;
+                        writer.WriteValue(Format(vec));
+                    }
+                    writer.WriteEndArray();
+                    return;
+                }
+
+                if (value is IDictionary dict)
+                {
+                    writer.WriteStartObject();
+                    var written = new HashSet<string>();
+                    foreach (DictionaryEntry entry in dict)
+                    {
+                        string key = entry.Key is Vector3 kv ? Format(kv) : entry.Key.ToString();
+                        if (!written.Add(key)) continue;
+                        writer.WritePropertyName(key);
+                        serializer.Serialize(writer, entry.Value);
+                    }
+                    writer.WriteEndObject();
+                }
+            }
+
+            public override object ReadJson(JsonReader reader, Type objectType, object existingValue, JsonSerializer serializer)
+            {
+                if (objectType == typeof(Vector3))
+                {
+                    return reader.TokenType switch
+                    {
+                        JsonToken.String => Parse((string)reader.Value),
+                        JsonToken.StartObject => Parse(JObject.Load(reader)),
+                        _ => throw new JsonSerializationException($"Unexpected token '{reader.TokenType}' when parsing Vector3.")
+                    };
+                }
+
+                if (objectType == typeof(List<Vector3>))
+                {
+                    var list = new List<Vector3>();
+                    if (reader.TokenType != JsonToken.StartArray)
+                    {
+                        throw new JsonSerializationException($"Unexpected token '{reader.TokenType}' when parsing List<Vector3>.");
+                    }
+                    while (reader.Read() && reader.TokenType != JsonToken.EndArray)
+                    {
+                        if (reader.TokenType == JsonToken.String)
+                        {
+                            list.Add(Parse((string)reader.Value));
+                        }
+                        else if (reader.TokenType == JsonToken.StartObject)
+                        {
+                            list.Add(Parse(JObject.Load(reader)));
+                        }
+                        else
+                        {
+                            throw new JsonSerializationException($"Unexpected token '{reader.TokenType}' inside List<Vector3>.");
+                        }
+                    }
+                    return list;
+                }
+
+                if (objectType == typeof(Dictionary<string, List<Vector3>>))
+                {
+                    var dict = new Dictionary<string, List<Vector3>>();
+                    var obj = JObject.Load(reader);
+                    foreach (var prop in obj.Properties())
+                    {
+                        var list = new List<Vector3>();
+                        foreach (var token in (JArray)prop.Value)
+                        {
+                            list.Add(token.Type == JTokenType.String ? Parse(token.ToString()) : Parse((JObject)token));
+                        }
+                        dict[prop.Name] = list;
+                    }
+                    return dict;
+                }
+
+                if (objectType == typeof(Dictionary<Vector3, List<Vector3>>))
+                {
+                    var dict = new Dictionary<Vector3, List<Vector3>>();
+                    var obj = JObject.Load(reader);
+                    foreach (var prop in obj.Properties())
+                    {
+                        var key = Parse(prop.Name);
+                        var list = new List<Vector3>();
+                        foreach (var token in (JArray)prop.Value)
+                        {
+                            list.Add(token.Type == JTokenType.String ? Parse(token.ToString()) : Parse((JObject)token));
+                        }
+                        dict[key] = list;
+                    }
+                    return dict;
+                }
+
+                if (objectType == typeof(Dictionary<string, Vector3>))
+                {
+                    var dict = new Dictionary<string, Vector3>();
+                    var obj = JObject.Load(reader);
+                    foreach (var prop in obj.Properties())
+                    {
+                        dict[prop.Name] = prop.Value.Type == JTokenType.String ? Parse(prop.Value.ToString()) : Parse((JObject)prop.Value);
+                    }
+                    return dict;
+                }
+
+                if (objectType == typeof(Dictionary<Vector3, DuelZoneInfo>))
+                {
+                    var dict = new Dictionary<Vector3, DuelZoneInfo>();
+                    var obj = JObject.Load(reader);
+                    foreach (var prop in obj.Properties())
+                    {
+                        var key = Parse(prop.Name);
+                        dict[key] = prop.Value.ToObject<DuelZoneInfo>(serializer);
+                    }
+                    return dict;
+                }
+
+                throw new JsonSerializationException($"Unsupported object type '{objectType}' for UnityVector3Converter.");
+            }
+        }
+
+        public class ZoneManagerInfo
+        {
+            internal string ZoneId;
+            internal Quaternion Rotation;
+            internal Vector3 Position;
+            internal Vector3 Size;
+            internal Vector3 extents;
+            internal float Distance;
+            internal bool IsBlocked;
+            internal const float M_RADIUS = 25f;
+
+            public ZoneManagerInfo(string id, Vector3 pos, Quaternion rot, float radius, Vector3 size, bool isBlocked, float dist)
+            {
+                (IsBlocked, ZoneId, Position, Rotation) = (isBlocked, id, pos, rot);
+
+                dist = Mathf.Max(dist, 100f);
+                Distance = radius + M_RADIUS + dist;
+
+                if (size != Vector3.zero)
+                {
+                    Size = size + new Vector3(dist, Position.y + 100f, dist);
+                    extents = Size * 0.5f;
+                }
+            }
+
+            public bool IsPositionInZone(Vector3 a)
+            {
+                if (Size != Vector3.zero)
+                {
+                    Vector3 v = Quaternion.Inverse(Rotation) * (a - Position);
+
+                    return v.x <= extents.x && v.x > -extents.x && v.y <= extents.y && v.y > -extents.y && v.z <= extents.z && v.z > -extents.z;
+                }
+                return InRange2D(Position, a, Distance);
+            }
+        }
+
+        public class DuelZoneInfo
         {
             public string name;
             public float radius;
-            public DuelZone() { }
-            public DuelZone(string name, float radius)
+            public DuelZoneInfo() { }
+            public DuelZoneInfo(string name, float radius)
             {
                 this.name = name;
                 this.radius = Mathf.Clamp(radius, 50f, 300f);
             }
         }
 
-        private class Tracker : FacepunchBehaviour
+        private class EscapedEventTracker : FacepunchBehaviour
         {
-            public BasePlayer player;
-            private Duelist _;
-            private bool isDestroyed;
+            internal BasePlayer player;
+            internal Duelist env;
+            internal bool isDestroyed;
+            internal bool duel;
+            internal ulong id;
 
-            private void Awake()
+            public void Init(BasePlayer player, Duelist env, bool duel)
             {
-                player = GetComponent<BasePlayer>();
-            }
-
-            public void Init(Duelist _)
-            {
-                this._ = _;
+                id = player.userID;
+                this.player = player;
+                this.env = env;
                 InvokeRepeating(Track, 0f, 0.5f);
             }
 
             private void Track()
             {
-                if (isDestroyed) return;
+                if (isDestroyed) 
+                    return;
+
                 if (player == null || player.IsDestroyed)
                 {
-                    isDestroyed = true;
-                    Destroy(this);
+                    env.RemoveEntities(id);
+                    DestroyMe();
                     return;
                 }
 
-                if (_.dataDuelists.ContainsKey(player.UserIDString) || _.tdmMatches.Exists(team => team.GetTeam(player) != Team.None))
+                if (duel ? !env.IsDuelist(player.UserIDString) : !env.IsTeamMember(player.UserIDString))
                 {
-                    if (!_.DuelTerritory(player.transform.position))
-                    {
-                        player.inventory.Strip();
-                        isDestroyed = true;
-                        Destroy(this);
-                    }
+                    return;
+                }
+
+                if (!env.DuelTerritory(player.transform.position))
+                {
+                    player.inventory.Strip();
+                    DestroyMe();
                 }
             }
 
-            private void OnDestroy()
+            public void DestroyMe()
             {
                 isDestroyed = true;
                 Destroy(this);
             }
         }
 
-        public static PooledList<T> GetPool<T>(IEnumerable<T> list1 = null, IEnumerable<T> list2 = null)
+        public static PooledList<T> GetPooledList<T>(IEnumerable<T> e1 = null, IEnumerable<T> e2 = null)
         {
             var pool = Pool.Get<PooledList<T>>();
-            if (list1 != null) pool.AddRange(list1);
-            if (list2 != null) pool.AddRange(list2);
+            if (e1 != null) pool.AddRange(e1);
+            if (e2 != null) pool.AddRange(e2);
             return pool;
         }
 
         public class Rematch
         {
-            public Rematch(Duelist _)
+            public Rematch(Duelist env)
             {
-                env = _;
+                this.env = env;
             }
             private Duelist env;
             public List<BasePlayer> Duelists = new();
@@ -204,40 +589,42 @@ namespace Oxide.Plugins
 
                 if (match == null)
                 {
-                    return GetPool(Duelists);
+                    return GetPooledList(Duelists);
                 }
 
-                return GetPool(Good, Evil);
+                return GetPooledList(Good, Evil);
             }
 
             public bool HasPlayer(BasePlayer player)
             {
-                using var players = GetAllPlayers();
-                return players.Contains(player);
+                if (match == null)
+                {
+                    return Duelists.Contains(player);
+                }
+                return Good.Contains(player) || Evil.Contains(player);
             }
 
-            public bool AddRange(HashSet<BasePlayer> players, Team team)
+            public bool AddRange(Dictionary<string, BasePlayer> players, Team team)
             {
-                foreach (var player in players)
+                foreach (var player in players.Values)
                 {
-                    if (IsNotConnected(player) || env.InEvent(player) || Good.Contains(player) || Evil.Contains(player))
-                        break;
+                    if (env.IsParticipant(player))
+                        return false;
 
-                    if (team == Team.Evil)
-                        Evil.Add(player);
-                    else
-                        Good.Add(player);
+                    GetTeam(team).Add(player);
                 }
 
-                return (team == Team.Evil ? Evil.Count : Good.Count) == players.Count;
+                return true;
+            }
+
+            public List<BasePlayer> GetTeam(Team team)
+            {
+                return team == Team.Evil ? Evil : Good;
             }
 
             public bool IsReady(BasePlayer player)
             {
-                if (env.InEvent(player) || !env.IsNewman(player) || env.duelsData.Bans.ContainsKey(player.UserIDString))
-                    return false;
-
-                return true;
+                return !env.IsParticipant(player) && env.IsNewman(player) && !env.data.Bans.ContainsKey(player.UserIDString);
             }
 
             public bool IsReady()
@@ -252,10 +639,10 @@ namespace Oxide.Plugins
                 return Ready.Count == (match == null ? 2 : match.TeamSize * 2);
             }
 
-            private void Reset(string key)
+            private void Reset(string key = null)
             {
                 env.tdmMatches.Remove(match);
-                MessageAll(key);
+                if (key != null) MessageAll(key);
                 Duelists.Clear();
                 Good.Clear();
                 Evil.Clear();
@@ -270,18 +657,21 @@ namespace Oxide.Plugins
                 using var players = GetAllPlayers();
                 foreach (var player in players)
                 {
-                    Message(player, env.msg(key, player.UserIDString, args));
+                    env.Message(player, key, args);
                 }
             }
 
-            public void Notify()
+            public void ReadyCheck()
             {
-                MessageAll("RematchNotify", 60f, match == null ? env.szDuelChatCommand : env.szMatchChatCommand);
-
                 using var players = GetAllPlayers();
                 foreach (var player in players)
-                    if (env.duelsData.AutoReady.Contains(player.UserIDString))
+                {
+                    if (env.autoReady || env.data.AutoReady.Contains(player.UserIDString))
+                    {
                         Ready.Add(player);
+                    }
+                    else env.Message(player, "RematchNotify", 60f, match == null ? env.szDuelChatCommand : env.szMatchChatCommand);
+                }
 
                 if (IsReady())
                 {
@@ -292,36 +682,6 @@ namespace Oxide.Plugins
                     _notify = env.timer.Once(60f, Cancel);
             }
 
-            private void Cancel()
-            {
-                if (match != null && match.IsPublic)
-                    return;
-
-                if (env.rematches.Contains(this))
-                {
-                    if (env.sendHomeSpectatorWhenRematchTimesOut)
-                    {
-                        using var players = GetAllPlayers();
-                        foreach (var player in players)
-                        {
-                            if (env.IsSpectator(player))
-                            {
-                                env.EndSpectate(player);
-                                env.SendHome(player);
-                            }
-                        }
-                    }
-
-                    if (match != null)
-                    {
-                        match.Reuse();
-                    }
-
-                    env.tdmMatches.Remove(match);
-                    Reset("RematchTimedOut");
-                }
-            }
-
             public void Start()
             {
                 if (match == null)
@@ -329,26 +689,60 @@ namespace Oxide.Plugins
                     var player = Ready[0];
                     var target = Ready[1];
 
-                    if (!env.SelectZone(player, target))
+                    if (!env.SelectZone(player, target, false))
                     {
-                        Message(player, env.msg("AllZonesFull", player.UserIDString, env.duelingZones.Count, env.playersPerZone));
-                        Message(target, env.msg("AllZonesFull", target.UserIDString, env.duelingZones.Count, env.playersPerZone));
+                        env.Message(player, "AllZonesFull", env.duelingZones.Count, env.playersPerZone);
+                        env.Message(target, "AllZonesFull", env.duelingZones.Count, env.playersPerZone);
                     }
                 }
                 else
                 {
-                    match.Reuse();
+                    match.Reuse(false);
                     env.tdmMatches.Add(match);
 
                     if (!AddMatchPlayers(Good, Team.Good) || !AddMatchPlayers(Evil, Team.Evil))
                     {
                         Reset("RematchFailed");
-                        match.Reuse();
+                        match.Reuse(true);
                     }
                 }
 
                 _notify?.Destroy();
                 env.rematches.Remove(this);
+            }
+
+            private void Cancel()
+            {
+                if (match != null && match.IsPublic)
+                    return;
+
+                if (env.rematches.Contains(this))
+                    return;
+
+                if (env.sendHomeSpectatorWhenRematchTimesOut)
+                {
+                    using var players = GetAllPlayers();
+                    foreach (var player in players)
+                    {
+                        if (player is DuelistNPC)
+                        {
+                            player.DelayedSafeKill();
+                            continue;
+                        }
+                        if (env.IsSpectating(player))
+                        {
+                            env.EndSpectate(player);
+                            env.SendHome(player);
+                        }
+                    }
+                }
+
+                if (match != null)
+                {
+                    match.Reuse(true);
+                }
+
+                Reset("RematchTimedOut");
             }
 
             private bool AddMatchPlayers(List<BasePlayer> players, Team team)
@@ -361,48 +755,102 @@ namespace Oxide.Plugins
             }
         }
 
-        public class AttackerInfo
-        {
-            public string AttackerName = string.Empty;
-            public string AttackerId = string.Empty;
-            public string BoneName = string.Empty;
-            public string Distance = string.Empty;
-            public string Weapon = string.Empty;
-        }
-
         public class GoodVersusEvilMatch
         {
-            public GoodVersusEvilMatch(Duelist _)
+            public class Host
             {
-                this.env = _;
+                public int RoundsWon;
+                public string ID = string.Empty;
+                public string Name = string.Empty;
+                public string Code = string.Empty;
+                public HashSet<string> KIA = new();
+                public Dictionary<string, BasePlayer> Rematch = new();
+                public Dictionary<string, BasePlayer> Players = new();
+                public void SetNewHostId()
+                {
+                    foreach (var player in Players.Values)
+                    {
+                        if (player != null)
+                        {
+                            ID = player.UserIDString;
+                            return;
+                        }
+                    }
+                    ID = string.Empty;
+                }
+                public bool CanRematch() => Rematch.Count > 0 && !Rematch.Values.Exists(IsNotConnected);
             }
+            
+            public GoodVersusEvilMatch(Duelist env)
+            {
+                this.env = env;
+                TotalRounds = env.config.Deathmatch.Rounds;
+            }
+
+            public bool Equals(GoodVersusEvilMatch match) => match.Id == Id;
+
+            public string Id { get; } = Guid.NewGuid().ToString();
             private Duelist env;
             private HashSet<ulong> _banned = new();
-            private HashSet<BasePlayer> _evil = new();
-            private HashSet<string> _evilKIA = new();
-            private HashSet<BasePlayer> _evilRematch = new();
-            private HashSet<BasePlayer> _good = new();
-            private HashSet<string> _goodKIA = new();
-            private HashSet<BasePlayer> _goodRematch = new();
-            private string _goodHostName = string.Empty;
-            private string _evilHostName = string.Empty;
-            private string _goodHostId = string.Empty;
-            private string _evilHostId = string.Empty;
-            private string _goodCode = string.Empty;
-            private string _evilCode = string.Empty;
+            private HashSet<ulong> IsLocked = new();
+            private Timer _queueTimer;
+            private DuelingZone _zone;
+            internal Host Good = new();
+            internal Host Evil = new();
             private int _teamSize = 2;
             private bool _started;
             private bool _ended;
-            private string _kit = string.Empty;
-            private DuelingZone _zone;
-            private Timer _queueTimer;
-            private bool _enteredQueue;
+            private bool _queued;
             private bool _public;
             public bool CanRematch = true;
+            private string _kit = string.Empty;
 
-            public string Id => _goodHostId + _evilHostId;
+            public string Versus => string.Format("{0} / {1} {2}v{2}", Good.Name, Evil.Name, _teamSize);
 
-            public string Versus => string.Format("{0} / {1} {2}v{2}", _goodHostName, _evilHostName, _teamSize);
+            public int RoundIndex; // 0‑based counter
+            public int TotalRounds = 3;
+            public Dictionary<string, int> RoundsLeft = new(); // userid + rounds left
+            
+            private void InitRounds()
+            {
+                RoundsLeft.Clear();
+                foreach (var id in Good.Players.Keys)
+                {
+                    RoundsLeft[id] = TotalRounds;
+                }
+                foreach (var id in Evil.Players.Keys)
+                {
+                    RoundsLeft[id] = TotalRounds;
+                }
+            }
+
+            private void DecrementRounds()
+            {
+                using var keys = GetPooledList<string>();
+                keys.AddRange(RoundsLeft.Keys);
+                foreach (var id in keys)
+                {
+                    if (--RoundsLeft[id] <= 0)
+                    {
+                        RoundsLeft.Remove(id);
+                    }
+                }
+            }
+
+            private void ResetRounds()
+            {
+                RoundIndex = 0;
+                Good.RoundsWon = 0;
+                Evil.RoundsWon = 0;
+                Good.Players.Clear();
+                Evil.Players.Clear();
+            }
+
+            public int RoundsCompleted() => Good.RoundsWon + Evil.RoundsWon;
+
+            public bool HasRoundsLeft(string userid) => RoundsLeft.TryGetValue(userid, out int value) && value > 0;
+
+            public bool SendDefeatedHome(string userid) => env.sendDefeatedHome && !HasRoundsLeft(userid);
 
             public bool IsPublic
             {
@@ -431,7 +879,7 @@ namespace Oxide.Plugins
 
             public DuelingZone Zone => _zone;
 
-            public bool EitherEmpty => _good.Count == 0 || _evil.Count == 0;
+            public bool EitherEmpty => Good.Players.Count == 0 || Evil.Players.Count == 0;
 
             public bool IsStarted
             {
@@ -462,44 +910,56 @@ namespace Oxide.Plugins
 
                     if (!EitherEmpty)
                     {
-                        using var players = GetAllPlayers();
-                        foreach (var player in players) env.duelsData.Kits[player.UserIDString] = _kit;
-                        MessageAll("MatchKitSet", _kit);
+                        SetPlayerKit(Good);
+                        SetPlayerKit(Evil);
                     }
                 }
             }
 
-            public void Reuse()
+            private void SetPlayerKit(Host host)
+            {
+                foreach (var user in host.Players)
+                {
+                    if (user.Value != null)
+                    {
+                        env.data.Kits[user.Key] = _kit;
+                        Message(user.Value, "MatchKitSet", _kit);
+                    }
+                    else env.data.Kits.Remove(user.Key);
+                }
+            }
+
+            public void Reuse(bool kia)
             {
                 if (_zone != null)
                     _zone.IsLocked = false;
 
-                _evilRematch.Clear();
-                _goodRematch.Clear();
-                _good.Clear();
-                _evil.Clear();
-                _goodKIA.Clear();
-                _evilKIA.Clear();
+                if (kia)
+                {
+                    Evil.KIA.Clear();
+                    Good.KIA.Clear();
+                }
+
+                Evil.Rematch.Clear();
+                Evil.Players.Clear();
+                Good.Rematch.Clear();
+                Good.Players.Clear();
                 _started = false;
                 _ended = false;
-                _enteredQueue = false;
+                _queued = false;
                 _kit = env.GetRandomKit();
-                var good = BasePlayer.activePlayerList.FirstOrDefault(x => x.displayName == _goodHostName);
-                if (good != null) _goodHostId = good.UserIDString;
-                var evil = BasePlayer.activePlayerList.FirstOrDefault(x => x.displayName == _evilHostName);
-                if (evil != null) _evilHostId = evil.UserIDString;
                 env.matchUpdateRequired = true;
             }
 
             public void Setup(BasePlayer player, BasePlayer target)
             {
                 env.tdmMatches.Add(this);
-                _goodHostName = player.displayName;
-                _goodHostId = player.UserIDString;
-                _evilHostName = target.displayName;
-                _evilHostId = target.UserIDString;
-                _goodCode = Random.Range(10000, 99999).ToString();
-                _evilCode = Random.Range(10000, 99999).ToString();
+                Good.Name = player.displayName;
+                Good.ID = player.UserIDString;
+                Evil.Name = target.displayName;
+                Evil.ID = target.UserIDString;
+                Good.Code = Random.Range(10000, 99999).ToString();
+                Evil.Code = Random.Range(10000, 99999).ToString();
 
                 if (_teamSize < env.minDeathmatchSize)
                     _teamSize = env.minDeathmatchSize;
@@ -515,69 +975,123 @@ namespace Oxide.Plugins
 
                 if (TeamSize > 1)
                 {
-                    Message(player, env.msg("MatchOpened", player.UserIDString, env.szMatchChatCommand, _goodCode));
-                    Message(target, env.msg("MatchOpened", target.UserIDString, env.szMatchChatCommand, _evilCode));
+                    Message(player, "MatchOpened", env.szMatchChatCommand, Good.Code);
+                    Message(target, "MatchOpened", env.szMatchChatCommand, Evil.Code);
                 }
 
                 env.matchUpdateRequired = true;
             }
+            
+            public bool IsAlliedTo(BasePlayer player, Team team) => env.IsAllied(player.UserIDString, GetHost(team).ID);
+            
+            public bool IsHost(BasePlayer player) => player.UserIDString == Good.ID || player.UserIDString == Evil.ID;
 
-            public bool IsFull() => _good.Count == _teamSize && _evil.Count == _teamSize;
-
-            public bool IsFull(Team team) => team == Team.Good ? _good.Count == _teamSize : _evil.Count == _teamSize;
-
-            public void MessageAll(string key, params object[] args)
+            public bool IsHost(BasePlayer player, out Host host)
             {
-                env.Message(_good, key, args);
-                env.Message(_evil, key, args);
+                if (player.UserIDString == Good.ID)
+                {
+                    host = Good;
+                    return true;
+                }
+                if (player.UserIDString == Evil.ID)
+                {
+                    host = Evil;
+                    return true;
+                }
+                host = null;
+                return false;
             }
 
-            public Team GetTeam(BasePlayer player) => _good.Contains(player) ? Team.Good : _evil.Contains(player) ? Team.Evil : Team.None;
+            public bool IsFull() => Good.Players.Count >= _teamSize && Evil.Players.Count >= _teamSize;
+            
+            public bool IsFull(Team team) => GetHost(team).Players.Count >= _teamSize;
 
-            public bool IsHost(BasePlayer player) => player.UserIDString == _goodHostId || player.UserIDString == _evilHostId;
+            public string GetCode(Team team) => team == Team.Good ? Good.Code : Evil.Code;
 
-            public void SetCode(BasePlayer player, string code)
+            public string GetCode(Host host) => host.Code;
+
+            public void SetCode(Host host, string code) => host.Code = code;
+            
+            public void SetCode(Team team, string code) => GetHost(team).Code = code;
+
+            public Host GetHost(Team team) => team == Team.Good ? Good : Evil;
+
+            public Host GetOpposingHost(Team team) => team == Team.Good ? Evil : Good;
+
+            public string GetHostName(Team team) => team == Team.Good ? Good.Name : Evil.Name;
+
+            public string GetOpposingName(Team team) => team == Team.Good ? Evil.Name : Good.Name;
+
+            public IEnumerable<BasePlayer> GetTeamMembers(Team team) => GetHost(team).Players.Values;
+
+            public Team GetTeam(BasePlayer player) => player == null ? Team.None : GetTeam(player.UserIDString);
+
+            public Team GetTeam(string userid) => Good.Players.ContainsKey(userid) ? Team.Good : Evil.Players.ContainsKey(userid) ? Team.Evil : Team.None;
+
+            public string GetTeamNames(Team team)
             {
-                if (GetTeam(player) == Team.Evil) _evilCode = code;
-                else if (GetTeam(player) == Team.Good) _goodCode = code;
+                using var sb = DisposableBuilder.Get();
+                foreach (var player in GetTeamMembers(team))
+                {
+                    if (player != null)
+                    {
+                        sb.Append(player.displayName).Append(", ");
+                    }
+                }
+                if (sb.Length > 0)
+                {
+                    sb.Length -= 2;
+                    return sb.ToString();
+                }
+                return string.Empty;
             }
-
-            public string Code(Team team) => team == Team.Good ? _goodCode : _evilCode;
-
-            public bool AlliedTo(BasePlayer player, Team team) => env.IsAllied(player.UserIDString, team == Team.Good ? _goodHostId : _evilHostId);
 
             public bool IsBanned(ulong targetId) => _banned.Contains(targetId);
 
             public bool Ban(BasePlayer target)
             {
-                if (target.UserIDString == _goodHostId || target.UserIDString == _evilHostId || IsBanned(target.userID))
+                if (IsHost(target) || IsBanned(target.userID))
                     return false;
 
                 _banned.Add(target.userID);
+                RoundsLeft.Remove(target.UserIDString);
                 RemoveMatchPlayer(target);
                 return true;
             }
 
-            public bool Equals(GoodVersusEvilMatch match) => match._good.Equals(_good) && match._evil.Equals(_evil);
+            public void MessageAll(string key, params object[] args)
+            {
+                Message(Good.Players.Values, key, args);
+                Message(Evil.Players.Values, key, args);
+            }
 
-            public string GetNames(Team team) => string.Join(", ", team == Team.Good ? _good.Select(player => player.displayName) : _evil.Select(player => player.displayName));
+            private void Message(BasePlayer player, string key, params object[] args) => env.Message(player, key, args);
+
+            private void Message(IEnumerable<BasePlayer> players, string key, params object[] args) => env.MessageAll(players, key, args);
 
             public void GiveShirt(BasePlayer player)
             {
-                Item item = ItemManager.CreateByName(env.teamShirt, 1, GetTeam(player) == Team.Evil ? env.teamEvilShirt : env.teamGoodShirt);
+                var team = GetTeam(player);
+                var shirtName = env.teamShirt;
+                var fallbackSkin = team == Team.Evil ? 14177UL : 101UL;
+                var teamSkin = team == Team.Evil ? env.teamEvilShirt : env.teamGoodShirt;
+                var def = ItemManager.FindItemDefinition(shirtName);
 
-                if (item == null)
-                    return;
+                if (def != null && env.RequiresOwnership(def, teamSkin)) 
+                    teamSkin = fallbackSkin;
 
-                if (item.info.category != ItemCategory.Attire)
-                {
-                    item.Remove(0.01f);
-                    return;
-                }
+                if (IsLocked.Add(player.userID))
+                    player.inventory.containerWear.SetLocked(true);
 
                 foreach (Item wear in player.inventory.containerWear.itemList)
                 {
-                    if (wear.info.shortname.Contains("shirt"))
+                    if (wear.info.shortname == shirtName)
+                    {
+                        wear.skin = teamSkin;
+                        wear.MarkDirty();
+                        return;
+                    }
+                    if (wear.info.shortname.Contains("hoodie") || wear.info.shortname.Contains("shirt"))
                     {
                         wear.RemoveFromContainer();
                         wear.Remove(0.01f);
@@ -585,58 +1099,56 @@ namespace Oxide.Plugins
                     }
                 }
 
-                if (!item.MoveToContainer(player.inventory.containerWear, -1, false)) item.Remove();
+                if (def == null || def.category != ItemCategory.Attire)
+                    return;
 
-                if (!player.inventory.containerWear.HasFlag(ItemContainer.Flag.IsLocked))
-                    player.inventory.containerWear.SetFlag(ItemContainer.Flag.IsLocked, true);
+                var skin = ItemDefinition.FindSkin(def.itemid, (int)teamSkin);
+                var item = skin != teamSkin ? ItemManager.CreateByName("tshirt", 1, fallbackSkin) : ItemManager.Create(def, 1, skin);
+                if (item != null && !item.MoveToContainer(player.inventory.containerWear))
+                    item.Remove();
             }
 
             public bool AddMatchPlayer(BasePlayer player, Team team)
             {
-                if (_started)
+                if (IsStarted)
                 {
-                    Message(player, env.msg("MatchStartedAlready", player.UserIDString));
+                    Message(player, "MatchStartedAlready");
                     return false;
                 }
 
-                _good.RemoveWhere(IsNotConnected);
-                _evil.RemoveWhere(IsNotConnected);
+                Good.Players.RemoveWhere(IsNotConnected);
+                Evil.Players.RemoveWhere(IsNotConnected);
 
-                if (_banned.Contains(player.userID))
+                if (IsBanned(player.userID))
                     return false;
 
                 if (!env.IsNewman(player))
                 {
-                    Message(player, env.msg("MustBeNaked", player.UserIDString));
+                    Message(player, "MustBeNaked");
                     return false;
                 }
 
-                switch (team)
+                var host = GetHost(team);
+                var opponent = GetOpposingHost(team);
+
+                if (host.Players.Count >= _teamSize)
                 {
-                    case Team.Good:
-                        if (_good.Count == _teamSize)
-                        {
-                            Message(player, env.msg("MatchTeamFull", player.UserIDString, _teamSize));
-                            return false;
-                        }
-
-                        _good.Add(player);
-                        MessageAll("MatchJoinedTeam", player.displayName, _goodHostName, _good.Count, _teamSize, _evilHostName, _evil.Count);
-                        break;
-                    case Team.Evil:
-                        if (_evil.Count == _teamSize)
-                        {
-                            Message(player, env.msg("MatchTeamFull", player.UserIDString, _teamSize));
-                            return false;
-                        }
-
-                        _evil.Add(player);
-                        MessageAll("MatchJoinedTeam", player.displayName, _evilHostName, _evil.Count, _teamSize, _goodHostName, _good.Count);
-                        break;
+                    Message(player, "MatchTeamFull", _teamSize);
+                    return false;
                 }
 
-                if (_good.Count == _teamSize && _evil.Count == _teamSize)
+                RoundsLeft.TryAdd(player.UserIDString, TotalRounds);
+                host.Players[player.UserIDString] = player;
+
+                if (RoundIndex == 0)
+                {
+                    MessageAll("MatchJoinedTeam", player.displayName, host.Name, host.Players.Count, _teamSize, opponent.Name, opponent.Players.Count);
+                }
+
+                if (IsFull())
+                {
                     Queue();
+                }
 
                 return true;
             }
@@ -646,387 +1158,594 @@ namespace Oxide.Plugins
                 if (player == null)
                     return false;
 
-                if (player.inventory.containerWear.HasFlag(ItemContainer.Flag.IsLocked))
-                    player.inventory.containerWear.SetFlag(ItemContainer.Flag.IsLocked, false);
+                if (IsLocked.Remove(player.userID))
+                    player.inventory.containerWear.SetLocked(false);
 
                 env.Metabolize(player, false);
-                env.Track(player, false);
+                env.SetEscapedEventTracker(player, false, false);
                 env.RemoveEntities(player.userID);
-                Interface.Oxide.CallHook("DisableBypass", player.userID.Get());
+                Interface.Oxide.CallHook("DisableBypass", (ulong)player.userID);
 
-                if (env.DuelTerritory(player.transform.position))
+                if (!HasRoundsLeft(player.UserIDString) && env.DuelTerritory(player.transform.position))
                 {
-                    if (env.sendDefeatedHome)
-                        env.SendHome(player);
-                    else
+                    if (SendDefeatedHome(player.UserIDString))
+                    {
+                        if (player is DuelistNPC)
+                        {
+                            player.DelayedSafeKill();
+                        }
+                        else env.SendHome(player);
+                    }
+                    else //if (!IsOver)
+                    {
                         env.StartSpectate(player);
+                    }
                 }
 
                 if (IsOver)
                 {
-                    _good.Remove(player);
-                    _evil.Remove(player);
+                    Good.Players.Remove(player.UserIDString);
+                    Evil.Players.Remove(player.UserIDString);
                     return true;
                 }
 
-                if (_good.Remove(player))
-                {
-                    if (_good.Count == 0)
-                    {
-                        if (_started)
-                        {
-                            _goodKIA.Add(player.UserIDString);
-                            _goodRematch.Add(player);
-                        }
-                        else MessageAll("MatchNoPlayersLeft");
-
-                        EndMatch(Team.Evil);
-                        return true;
-                    }
-                    if (_started)
-                    {
-                        _goodKIA.Add(player.UserIDString);
-                        _goodRematch.Add(player);
-                    }
-
-                    if (player.UserIDString == _goodHostId)
-                        AssignGoodHostId();
-
-                    return true;
-                }
-
-                if (_evil.Remove(player))
-                {
-                    if (_evil.Count == 0)
-                    {
-                        if (_started)
-                        {
-                            _evilKIA.Add(player.UserIDString);
-                            _evilRematch.Add(player);
-                        }
-                        else MessageAll("MatchNoPlayersLeft");
-
-                        EndMatch(Team.Good);
-                        return true;
-                    }
-                    if (_started)
-                    {
-                        _evilKIA.Add(player.UserIDString);
-                        _evilRematch.Add(player);
-                    }
-
-                    if (player.UserIDString == _evilHostId)
-                        AssignEvilHostId();
-
-                    return true;
-                }
-
-                return false;
+                return RemoveMatchPlayer(player, Team.Good) || RemoveMatchPlayer(player, Team.Evil);
             }
 
-            private void AssignGoodHostId()
+            private bool RemoveMatchPlayer(BasePlayer player, Team team)
             {
-                _good.RemoveWhere(IsNotConnected);
-
-                if (_good.Count > 0)
+                Host host = GetHost(team);
+                if (!host.Players.Remove(player.UserIDString))
+                    return false;
+                
+                if (host.Players.Count == 0)
                 {
-                    _goodHostId = _good.FirstOrDefault().UserIDString;
-                    env.matchUpdateRequired = true;
+                    if (_started)
+                    {
+                        host.KIA.Add(player.UserIDString);
+                        host.Rematch[player.UserIDString] = player;
+                    }
+                    else MessageAll("MatchNoPlayersLeft");
+
+                    EndMatch(team == Team.Evil ? Team.Good : Team.Evil);
+                    return true;
                 }
-                else EndMatch(Team.Evil);
+
+                if (_started)
+                {
+                    host.KIA.Add(player.UserIDString);
+                    host.Rematch[player.UserIDString] = player;
+                }
+
+                if (player.UserIDString == host.ID)
+                    AssignHostId(host, team);
+
+                return true;
             }
 
-            private void AssignEvilHostId()
+            private void AssignHostId(Host host, Team team)
             {
-                _evil.RemoveWhere(IsNotConnected);
+                host.Players.RemoveWhere(IsNotConnected);
 
-                if (_evil.Count > 0)
+                if (host.Players.Count > 0)
                 {
-                    _evilHostId = _evil.FirstOrDefault().UserIDString;
+                    host.SetNewHostId();
                     env.matchUpdateRequired = true;
                 }
-                else EndMatch(Team.Good);
+                else EndMatch(team);
             }
 
             private void Finalize(Team team)
             {
-                Interface.CallHook("OnDuelistFinalized", team == Team.Good ? _goodKIA : _evilKIA);
+                Host victor = GetHost(team);
+                Host loser = GetOpposingHost(team);
 
-                switch (team)
+                victor.KIA.UnionWith(victor.Rematch.Keys);
+                loser.KIA.UnionWith(loser.Rematch.Keys);
+                
+                Interface.CallHook("OnDuelistFinalized", victor.KIA);
+
+                UpdateSide(loser.KIA, Points.MatchLoss);
+                UpdateSide(victor.KIA, Points.MatchVictory);
+
+                Good.KIA.Clear();
+                Evil.KIA.Clear();
+            }
+            
+            private void UpdateSide(IEnumerable<string> ids, Points stat)
+            {
+                foreach (var id in ids)
                 {
-                    case Team.Evil:
-                        {
-                            foreach (var playerId in _goodKIA)
-                            {
-                                env.UpdateMatchStats(playerId, false, true, false, false);
-                                env.UpdateMatchSizeStats(playerId, true, false, _teamSize);
-                            }
+                    if (stat == Points.MatchVictory)
+                        env.AwardPlayer(id, env.teamEconomicsMoney, env.teamServerRewardsPoints);
 
-                            foreach (var playerId in _evilKIA)
-                            {
-                                env.AwardPlayer(playerId, env.teamEconomicsMoney, env.teamServerRewardsPoints);
-                                env.UpdateMatchStats(playerId, true, false, false, false);
-                                env.UpdateMatchSizeStats(playerId, false, true, _teamSize);
-                            }
-
-                            break;
-                        }
-                    case Team.Good:
-                        {
-                            foreach (var playerId in _evilKIA)
-                            {
-                                env.UpdateMatchStats(playerId, false, true, false, false);
-                                env.UpdateMatchSizeStats(playerId, true, false, _teamSize);
-                            }
-
-                            foreach (var playerId in _goodKIA)
-                            {
-                                env.AwardPlayer(playerId, env.teamEconomicsMoney, env.teamServerRewardsPoints);
-                                env.UpdateMatchStats(playerId, true, false, false, false);
-                                env.UpdateMatchSizeStats(playerId, false, true, _teamSize);
-                            }
-
-                            break;
-                        }
+                    env.UpdateMatchStats(id, stat);
+                    env.UpdateMatchSizeStats(id, _teamSize, stat);
                 }
-
-                _goodKIA.Clear();
-                _evilKIA.Clear();
             }
 
             private bool SetupRematch()
             {
-                if (!CanRematch || _goodRematch.Exists(IsNotConnected) || _evilRematch.Exists(IsNotConnected))
+                if (!CanRematch || !Good.CanRematch() || !Evil.CanRematch())
                     return false;
 
-                var rematch = new Rematch(env);
-
-                if (rematch.AddRange(_evilRematch, Team.Evil) && rematch.AddRange(_goodRematch, Team.Good))
+                Rematch rematch = new(env);
+                if (rematch.AddRange(Evil.Rematch, Team.Evil) && rematch.AddRange(Good.Rematch, Team.Good))
                 {
-                    rematch.match = this;
-                    rematch.Notify();
                     env.rematches.Add(rematch);
+                    rematch.match = this;
+                    rematch.ReadyCheck();
                     return true;
                 }
 
                 return false;
             }
 
-            private void EndMatch(Team team)
+            public void EndMatch(Team team)
             {
                 if (!_ended && _started)
                 {
-                    Finalize(team);
-                    var defeat = env.msg("MatchDefeat", null, team == Team.Evil ? _evilHostName : _goodHostName, team == Team.Evil ? _goodHostName : _evilHostName, _teamSize);
-                    if (!string.IsNullOrEmpty(defeat)) env.Puts(defeat);
+                    DecrementRounds(); // burn a round for everyone
                     IsOver = true;
                     IsStarted = false;
+                    _queued = false;
 
-                    using var evil = GetPool(_evil);
+                    using var evil = GetPooledList(Evil.Players.Values);
 
                     foreach (var player in evil)
                     {
                         RemoveMatchPlayer(player);
 
-                        if (player != null && player.IsConnected && !_evilRematch.Contains(player))
-                            _evilRematch.Add(player);
+                        if (IsConnected(player) && !Evil.Rematch.ContainsKey(player.UserIDString))
+                        {
+                            Evil.Rematch[player.UserIDString] = player;
+                            player.inventory.Strip();
+                        }
                     }
 
-                    using var good = GetPool(_good);
+                    using var good = GetPooledList(Good.Players.Values);
 
                     foreach (var player in good)
                     {
                         RemoveMatchPlayer(player);
 
-                        if (player != null && player.IsConnected && !_goodRematch.Contains(player))
-                            _goodRematch.Add(player);
-                    }
-
-                    foreach (var target in BasePlayer.activePlayerList)
-                    {
-                        if (target == null || target.displayName == null)
-                            continue;
-
-                        if (env.guiAnnounceUITime > 0f && (_goodKIA.Contains(target.UserIDString) || _evilKIA.Contains(target.UserIDString)))
-                            env.CreateAnnouncementUI(target, env.msg("MatchDefeat", target.UserIDString, team == Team.Evil ? _evilHostName : _goodHostName, team == Team.Evil ? _goodHostName : _evilHostName, _teamSize));
-
-                        if (env.duelsData.Chat.Contains(target.UserIDString) && !_goodKIA.Contains(target.UserIDString) && !_evilKIA.Contains(target.UserIDString))
-                            continue;
-
-                        Message(target, env.msg("MatchDefeat", target.UserIDString, team == Team.Evil ? _evilHostName : _goodHostName, team == Team.Evil ? _goodHostName : _evilHostName, _teamSize));
-                    }
-
-                    if (!SetupRematch())
-                    {
-                        using var players = GetPool(_evilRematch, _goodRematch);
-
-                        foreach (var player in players)
+                        if (IsConnected(player) && !Good.Rematch.ContainsKey(player.UserIDString))
                         {
-                            if (IsNotConnected(player)) continue;
-                            Message(player, env.msg("RematchFailed2", player.UserIDString));
+                            Good.Rematch[player.UserIDString] = player;
+                            player.inventory.Strip();
                         }
-
-                        Reuse();
                     }
+
+                    // more rounds left?
+                    GetHost(team).RoundsWon += 1;
+                    if (TotalRounds > 1 && RoundIndex < TotalRounds && CanRematch && Good.CanRematch() && Evil.CanRematch())
+                    {
+                        _started = false;
+                        _ended = false;
+
+                        Rematch rematch = new(env);
+                        if (rematch.AddRange(Evil.Rematch, Team.Evil) && rematch.AddRange(Good.Rematch, Team.Good))
+                        {
+                            Good.KIA.Clear();
+                            Evil.KIA.Clear();
+                            env.rematches.Add(rematch);
+                            rematch.match = this;
+                            rematch.Start();
+                            return;
+                        }
+                    }
+
+                    int rounds = RoundsCompleted();
+                    team = Good.RoundsWon > Evil.RoundsWon ? Team.Good : Team.Evil;
+
+                    Puts(env.msg("MatchDefeat", null, GetHostName(team), GetOpposingName(team), _teamSize));
+
+                    using var targets = GetPlayerList();
+                    foreach (var target in targets)
+                    {
+                        if (env.guiAnnounceUITime > 0f && (Good.KIA.Contains(target.UserIDString) || Evil.KIA.Contains(target.UserIDString)))
+                            env.CreateAnnouncementUI(target, env.msg("MatchDefeat", target.UserIDString, GetHostName(team), GetOpposingName(team), _teamSize));
+
+                        if (!IsChatEnabled(target.UserIDString))
+                            continue;
+
+                        Message(target, "MatchDefeat", GetHostName(team), GetOpposingName(team), _teamSize);
+                    }
+
+                    Finalize(team);
+                    Good.RoundsWon = 0;
+                    Evil.RoundsWon = 0;
+
+                    if (TotalRounds > 1 && rounds >= TotalRounds)
+                    {
+                        End(true);
+                        TryRelocateZone();
+                        return;
+                    }
+
+                    if (TotalRounds <= 1)
+                    {
+                        TryRelocateZone();
+                    }
+
+                    if (SetupRematch())
+                    {
+                        return;
+                    }
+
+                    using var players = GetPooledList(Evil.Rematch.Values, Good.Rematch.Values);
+
+                    foreach (var player in players)
+                    {
+                        if (IsNotConnected(player)) continue;
+                        Message(player, "RematchFailed2");
+                    }
+
+                    Reuse(true);
                 }
 
                 End();
             }
 
-            public void End(bool forced = false)
+            // if it's time to relocate the zone then lock the zone so it cannot be used again. attempt to relocate if not occupied
+            public void TryRelocateZone()
+            {
+                if (_zone != null && !_zone.IsFinito)
+                {
+                    env.TryRelocateZone(_zone);
+                }
+            }
+
+            public bool IsChatEnabled(string userid) => !env.data.Chat.Contains(userid) || Good.KIA.Contains(userid) || Evil.KIA.Contains(userid);
+
+            public void End(bool defeat = false)
             {
                 if (_zone != null)
                     _zone.IsLocked = false;
 
                 _queueTimer?.Destroy();
 
-                using var players = GetPool(_good, _evil);
+                using var players = GetAllPlayers();
 
                 foreach (var player in players)
                 {
-                    if (IsNull(player))
-                        continue;
-
-                    if (player.inventory.containerWear.HasFlag(ItemContainer.Flag.IsLocked))
-                        player.inventory.containerWear.SetFlag(ItemContainer.Flag.IsLocked, false);
+                    if (IsLocked.Remove(player.userID))
+                        player.inventory.containerWear.SetLocked(false);
 
                     if (IsStarted || IsOver)
                     {
+                        env.Reappear(player);
                         if (env.DuelTerritory(player.transform.position))
                         {
                             player.inventory.Strip();
-                            env.SendHome(player);
+                            if (player is DuelistNPC)
+                            {
+                                player.DelayedSafeKill();
+                            }
+                            else if (!defeat || SendDefeatedHome(player.UserIDString))
+                            {
+                                env.SendHome(player);
+                            }
                         }
 
                         env.Metabolize(player, false);
-                        env.Track(player, false);
+                        env.SetEscapedEventTracker(player, false, false);
                     }
                 }
 
-                _good.Clear();
-                _evil.Clear();
+                ResetRounds();
                 env.tdmMatches.Remove(this);
                 env.matchUpdateRequired = true;
 
-                if (env.dataDuelists.Count == 0 && env.tdmMatches.Count == 0)
+                if (!env.AnyParticipants())
                     env.Unsubscribe(nameof(OnPlayerHealthChange));
             }
 
+            private float nextNakedMessageTime;
+
             private void Queue()
             {
-                DuelingZone zone = null;
+                DuelingZone teamZone = null;
+                DuelingZone spatialZone = null;
 
-                using var players = GetPool(_good, _evil);
+                using var players = GetAllPlayers();
+
+                int needed = env.requireTeamSize ? TeamSize * 2 : 2;
 
                 foreach (var player in players)
                 {
-                    if (player == null)
-                        continue;
-
                     if (!env.IsNewman(player))
                     {
-                        Message(player, env.msg("MustBeNaked", player.UserIDString));
-                        MessageAll("MatchIsNotNaked", player.displayName);
-                        _queueTimer = env.timer.Once(30f, Queue);
+                        if (Time.time > nextNakedMessageTime)
+                        {
+                            nextNakedMessageTime = Time.time + 30f;
+                            MessageAll("MatchIsNotNaked", player.displayName);
+                        }
+                        Message(player, "MustBeNaked");
+                        _queueTimer = env.timer.Once(2f, Queue);
                         return;
                     }
 
-                    if (zone == null)
-                        zone = env.GetPlayerZone(player, TeamSize);
+                    teamZone ??= env.GetPlayerZone(player, TeamSize);
+
+                    if (spatialZone == null)
+                    {
+                        var z = env.GetDuelZone(player.transform.position);
+                        if (IsZoneEmpty(z, needed))
+                            spatialZone = z;
+                    }
                 }
 
-                using var zones = GetPool(env.duelingZones.Where(x => x.TotalPlayers == 0 && !x.IsLocked && x.Spawns.Count >= (env.requireTeamSize ? TeamSize * 2 : 2)));
+                _zone = teamZone ?? spatialZone ?? FindGlobalZone(needed);
 
-                if (zones == null || zones.Count == 0)
+                if (_zone == null)
                 {
-                    if (!_enteredQueue)
+                    if (!_queued)
                     {
                         MessageAll("MatchQueued");
-                        _enteredQueue = true;
+                        _queued = true;
                     }
-
                     _queueTimer = env.timer.Once(2f, Queue);
-                    return;
                 }
+                else
+                {
+                    _queueTimer?.Destroy();
+                    //_enteredQueue = false;
+                    Start();
+                }
+            }
 
-                _zone = zone ?? LastZone ?? zones.GetRandom();
-                _queueTimer?.Destroy();
-                Start();
+            private DuelingZone FindGlobalZone(int needed)
+            {
+                using var zones = GetPooledList<DuelingZone>();
+                foreach (var z in env.duelingZones)
+                {
+                    if (IsZoneEmpty(z, needed)) zones.Add(z);
+                }
+                return zones.Count > 0 ? zones.GetRandom() : null;
             }
 
             public PooledList<BasePlayer> GetAllPlayers()
             {
-                _good.RemoveWhere(IsNotConnected);
-                _evil.RemoveWhere(IsNotConnected);
-                return GetPool(_good, _evil);
-            }
-
-            public DuelingZone LastZone
-            {
-                get
+                var players = GetPooledList<BasePlayer>();
+                foreach (var good in Good.Players.Values)
                 {
-                    using var players = GetAllPlayers();
-                    foreach (var player in players)
-                    {
-                        var zone = env.GetDuelZone(player.transform.position);
-                        if (zone != null && zone.TotalPlayers == 0 && !zone.IsLocked)
-                        {
-                            return zone;
-                        }
-                    }
-                    return null;
+                    if (IsConnected(good)) players.Add(good);
                 }
+                foreach (var evil in Evil.Players.Values)
+                {
+                    if (IsConnected(evil)) players.Add(evil);
+                }
+                return players;
             }
 
             private void Start()
             {
-                env.SubscribeHooks(true);
+                if (RoundIndex == 0)
+                    InitRounds();
+                RoundIndex++;
 
-                var goodSpawn = _zone.Spawns.GetRandom();
-                var evilSpawn = goodSpawn;
-                float dist = float.MinValue;
+                Vector3 goodSpawn = _zone.Spawns.GetRandom();
+                Vector3 evilSpawn = goodSpawn;
+                float maxSqr = float.MinValue;
+                Span<float> sqr = stackalloc float[_zone.Spawns.Count];
 
-                foreach (var spawn in _zone.Spawns) // get the furthest spawn point away from the good team and assign it to the evil team
+                for (int i = 0; i < _zone.Spawns.Count; i++) // get the furthest spawn point away from the good team as the initial spawn for the evil team
                 {
-                    var distance = (spawn - goodSpawn).sqrMagnitude;
-                    if (distance > dist)
+                    float d = (_zone.Spawns[i] - goodSpawn).sqrMagnitude;
+                    sqr[i] = d;
+
+                    if (d > maxSqr)
                     {
-                        dist = distance;
-                        evilSpawn = spawn;
+                        maxSqr = d;
+                        evilSpawn = _zone.Spawns[i];
                     }
                 }
 
-                env.Message(_good, "MatchStarted", GetNames(Team.Evil));
-                env.Message(_evil, "MatchStarted", GetNames(Team.Good));
-                _zone.IsLocked = true;
-                IsStarted = true;
+                float minSqr = maxSqr * 0.5625f; // 75 % gap (0.75)²
+                float teamSqr = minSqr * 0.25f; // 25 % of arena‑diameter²
+                using var evilSpawns = GetPooledList<Vector3>(); // ≥ 75% away from Good
+                using var goodSpawns = GetPooledList<Vector3>(); // ≥ 75% away from Evil
 
-                Spawn(_good, goodSpawn);
-                Spawn(_evil, evilSpawn);
+                for (int i = 0; i < _zone.Spawns.Count; i++)
+                {
+                    Vector3 p = _zone.Spawns[i];
+                    bool farFromGoodPrimary = sqr[i] >= minSqr; // distance to goodSpawn
+                    bool farFromEvilPrimary = (p - evilSpawn).sqrMagnitude >= minSqr;
+
+                    // Assign to the side that needs it most but keep both constraints where its ≥75 % from the other team, and ≤√teamSqr from mate
+                    if (farFromGoodPrimary && CloseToAny(evilSpawns, p, teamSqr) && FarFromAll(goodSpawns, p, minSqr) && (!farFromEvilPrimary || evilSpawns.Count > goodSpawns.Count || !FarFromAll(evilSpawns, p, minSqr)))
+                    {
+                        evilSpawns.Add(p);
+                    }
+                    else if (farFromEvilPrimary && CloseToAny(goodSpawns, p, teamSqr) && FarFromAll(evilSpawns, p, minSqr))
+                    {
+                        goodSpawns.Add(p);
+                    }
+                }
+
+                env.SubscribeHooks(true);
+
+                EnsureSpawnCapacity(goodSpawns, evilSpawns, minSqr, _zone.MaxY, Good.Players.Count, env.jitteredSpawns); // ensure sufficient spawn points
+                EnsureSpawnCapacity(evilSpawns, goodSpawns, minSqr, _zone.MaxY, Evil.Players.Count, env.jitteredSpawns);
+
+                Spawn(evilSpawns, goodSpawns);
             }
 
-            private void Spawn(HashSet<BasePlayer> players, Vector3 spawn)
+            private bool CloseToAny(List<Vector3> pts, Vector3 p, float maxSqr) // ⇒ cohesion within a team
             {
+                if (pts.Count == 0)
+                    return true;
+                for (int k = 0; k < pts.Count; k++)
+                    if ((p - pts[k]).sqrMagnitude <= maxSqr) // close enough ⇒ accept
+                        return true;
+                return false; // too far ⇒ reject
+            }
+
+            private bool FarFromAll(List<Vector3> pts, Vector3 p, float minSqr) // ⇒ separation between teams
+            {
+                for (int k = 0; k < pts.Count; k++)
+                    if ((p - pts[k]).sqrMagnitude < minSqr)
+                        return false; // too close ⇒ reject
+                return true; // far enough ⇒ accept
+            }
+
+            private Vector3 Closest(List<Vector3> pts, Vector3 p)
+            {
+                Vector3 closest = pts[0];
+                float best = float.MaxValue;
+                for (int i = 0; i < pts.Count; i++)
+                {
+                    float d = (pts[i] - p).sqrMagnitude;
+                    if (d < best)
+                    {
+                        best = d;
+                        closest = pts[i];
+                    }
+                }
+                return closest;
+            }
+
+            public const float SELF_EPS_SQR = 0.04f * 0.04f; // 4 cm radius ⇒ “same spot”
+
+            private void EnsureSpawnCapacity(List<Vector3> spawns, List<Vector3> opposing, float minSqr, float maxY, int required, bool jitterFirst)
+            {
+                if (spawns.Count == 0) 
+                    return;
+
+                int root = 0;
+                int tries = 0;
+                int cap = required * 32;
+                int baseCount = spawns.Count; // loop bounds
+
+                while (spawns.Count < required && tries++ < cap)
+                {
+                    Vector3 seed = spawns[root]; // pick root
+                    root = (root + 1) % spawns.Count; // bump & wrap
+
+                    // choose order according to flag
+                    if (jitterFirst ? JitterRing(seed) || FanOut(seed) : FanOut(seed) || JitterRing(seed))
+                        continue; // placed ⇒ next slot
+                }
+
+                while (spawns.Count < required) // absolute fallback with round-robin dup
+                    spawns.Add(spawns[spawns.Count % baseCount]); // exact dup
+
+                bool TryAdd(Vector3 pos)
+                {
+                    if (env.ValidSpawnPoint(pos) && FarFromAll(opposing, pos, minSqr) && FarFromAll(spawns, pos, SELF_EPS_SQR))
+                    {
+                        spawns.Add(new Vector3(pos.x, pos.y + 0.75f, pos.z)); // add
+                        return true;
+                    }
+                    return false; // reject
+                }
+
+                bool JitterRing(Vector3 s) // 25 cm offsets around seed
+                {
+                    for (int d = 0; d < 8; d++)
+                    {
+                        Vector3 p = s + env.Dir8[d] * 0.25f; // jitter
+                        p.y = GetSpawnHeight(p, maxY);
+                        if (TryAdd(p)) return true; // placed
+                    }
+                    return false; // none fit
+                }
+
+                bool FanOut(Vector3 s) // 0.5 m → 4 m radial sweep
+                {
+                    Vector3 dir = s - Closest(opposing, s); // away
+                    if (dir.sqrMagnitude < 0.01f) dir = Vector3.right; // fallback
+                    dir.y = 0; dir.Normalize(); // flatten
+
+                    for (float r = 0.5f; r <= 4f; r += 0.5f) // widen, bump r <= 6f if fails too often
+                    {
+                        Vector3 p = s + dir * r; // straight
+                        p.y = GetSpawnHeight(p, maxY);
+                        if (TryAdd(p)) return true; // placed
+
+                        for (int d = 0; d < 8; d++) // 8-dir sweep
+                        {
+                            p = s + env.Dir8[d] * r;
+                            p.y = GetSpawnHeight(p, maxY);
+                            if (TryAdd(p)) return true; // placed
+                        }
+                    }
+                    return false; // failed
+                }
+            }
+
+            private void Spawn(PooledList<Vector3> evilSpawns, PooledList<Vector3> goodSpawns)
+            {
+                Spawn(Good.Players.Values, goodSpawns); // every point ≥75 % from all Evil points
+                Spawn(Evil.Players.Values, evilSpawns); // every point ≥75 % from all Good points
+
+                if (RoundIndex == 1)
+                {
+                    Message(Good.Players.Values, "MatchStarted", GetTeamNames(Team.Evil));
+                    Message(Evil.Players.Values, "MatchStarted", GetTeamNames(Team.Good));
+                }
+                else if (RoundIndex <= TotalRounds)
+                {
+                    Message(Good.Players.Values, "MatchNextRound", RoundIndex, TotalRounds, GetTeamNames(Team.Evil));
+                    Message(Evil.Players.Values, "MatchNextRound", RoundIndex, TotalRounds, GetTeamNames(Team.Good));
+                }
+
+                _zone.IsLocked = true;
+                IsStarted = true;
+            }
+
+            private void Spawn(IEnumerable<BasePlayer> players, List<Vector3> spawns)
+            {
+                int count = spawns.Count;
                 foreach (var player in players)
                 {
-                    env.duelsData.Kits[player.UserIDString] = _kit;
+                    if (count == 0) count = spawns.Count; // recycle if we run out
+                    int idx = UnityEngine.Random.Range(0, count--);
+                    Vector3 spawn = spawns[idx];
+                    (spawns[idx], spawns[count]) = (spawns[count], spawn); // O(1) removal
+                    
+                    if (player is DuelistNPC)
+                        spawn.y -= 0.7f;
 
-                    if (!env.DuelTerritory(player.transform.position) || !env.duelsData.Homes.ContainsKey(player.UserIDString))
+                    env.data.Kits[player.UserIDString] = _kit;
+                    Vector3 pos = player.transform.position;
+
+                    if (player.IsHuman())
                     {
-                        var position = player.transform.position;
-                        if (env.IsOnConstruction(position)) position.y += 1; // prevent player from becoming stuck or dying when teleported home
-                        env.duelsData.Homes[player.UserIDString] = position.ToString();
+                        SaveHome(player, pos);
                     }
 
                     env.RemoveFromQueue(player.UserIDString);
-                    env.Teleport(player, spawn);
-
-                    if (env.immunityTime >= 1)
-                    {
-                        env.dataImmunity[player.UserIDString] = TimeStamp() + env.immunityTime;
-                        env.dataImmunitySpawns[player.UserIDString] = spawn;
-                    }
+                    env.EnableUserImmunity(player, spawn);
+                    env.Teleport(player, spawn, _zone.ProtectionRadius, !_zone.InRange(pos));
+                    SetViewingAngles(player, spawn, _zone.Location);
                 }
+            }
+
+            private void SaveHome(BasePlayer player, Vector3 pos)
+            {
+                if (!env.DuelTerritory(pos) || !env.data.Homes.ContainsKey(player.UserIDString))
+                {
+                    if (env.IsOnConstruction(pos)) pos.y += 1; // prevent player from becoming stuck or dying when teleported home
+                    env.data.Homes[player.UserIDString] = pos;
+                }
+            }
+
+            private static void SetViewingAngles(BasePlayer player, Vector3 from, Vector3 to)
+            {
+                Vector3 dir = to - from;
+                if (dir.sqrMagnitude < 0.001f) return; // ignore zero‑length
+
+                Quaternion look = Quaternion.LookRotation(dir, Vector3.up); // full (yaw + pitch)
+                Vector3 e = look.eulerAngles;
+                Quaternion bodyYaw = Quaternion.Euler(0f, e.y, 0f); // strip pitch/roll
+
+                player.transform.rotation = bodyYaw; // body only yaw
+                player.ServerRotation = bodyYaw;
+                player.OverrideViewAngles(new Vector3(e.x, e.y, 0f)); // pitch+yaw to client
+                player.eyes.NetworkUpdate(bodyYaw); // eyes follow body yaw
+                player.SendNetworkUpdateImmediate();
             }
         }
 
@@ -1054,11 +1773,19 @@ namespace Oxide.Plugins
 
         public class BetInfo
         {
-            public string trigger; // the trigger used to request this as a bet
-            public int amount; // amount the player bet
+            [JsonProperty(PropertyName = "amount", NullValueHandling = NullValueHandling.Ignore)]
+            public int? amount = null; // amount the player bet
+            public string trigger; // the trigger used to request the bet
             public int itemid; // the unique identifier of the item
             public int max; // the maximum amount allowed to bet on this item
-
+            public BetInfo() { }
+            public BetInfo(int? amount, string trigger, int max, int itemid)
+            {
+                this.amount = amount;
+                this.trigger = trigger;
+                this.max = max;
+                this.itemid = itemid;
+            }
             public bool Equals(BetInfo bet)
             {
                 return bet.amount == amount && bet.itemid == itemid;
@@ -1067,34 +1794,49 @@ namespace Oxide.Plugins
 
         public class DuelingZone : FacepunchBehaviour // Thanks @Jake_Rich for helping me get this started!
         {
-            private Duelist _ => Instance;
-            private HashSet<BasePlayer> _players = new();
-            private HashSet<BasePlayer> _waiting = new();
-            private Vector3 _zonePos;
-            public float ProtectionRadius;
+            private Dictionary<string, BasePlayer> _players = new();
+            private Dictionary<string, BasePlayer> _waiting = new();
+            internal HashSet<DuelistNPC> npcs = new();
+            internal List<BaseEntity> walls = new();
+            private List<Vector3> _spawns;
             private List<Vector3> _duelSpawns = new(); // spawn points generated on the fly
-            private List<SphereEntity> spheres = new();
+            private List<SphereEntity> spheres = new(); 
+            private Vector3 _zonePos, _zonePosXZ3D;
+            public float ProtectionRadius, SqrProtectionRadius;
+            public string zoneName;
             public bool IsLocked;
+            public bool IsFinito;
             public int Kills;
             public GameObject go;
+            internal Duelist env;
 
             public int TotalPlayers => _players.Count;
 
-            public List<BasePlayer> Players => new(_players);
+            public PooledList<BasePlayer> Players => GetPooledList(_players.Values);
+
+            public void ClearSpawns() => _spawns = null;
 
             public List<Vector3> Spawns
             {
                 get
                 {
-                    var spawns = _.GetSpawnPoints(this); // get custom spawn points if any exist
-
-                    return spawns == null || spawns.Count < 2 ? _duelSpawns : spawns;
+                    if (_spawns == null)
+                    {
+                        _spawns = env.GetSpawnPoints(this); // get custom spawn points if any exist
+                    }
+                    return _spawns.Count < 2 ? _duelSpawns : _spawns;
                 }
             }
 
-            public bool IsFull => TotalPlayers + _waiting.Count + 2 > _.playersPerZone || IsLocked;
+            public bool IsFull => IsLocked || TotalPlayers + _waiting.Count + 2 > env.playersPerZone;
 
-            public Vector3 Position => _zonePos;
+            public float MaxY => Location.y + ProtectionRadius;
+
+            public Vector3 Location => _zonePos;
+
+            public Vector3 LocationXZ3D => _zonePosXZ3D;
+
+            private void Message(BasePlayer player, string key, params object[] args) => env.Message(player, key, args);
 
             private void OnDestroy()
             {
@@ -1104,72 +1846,65 @@ namespace Oxide.Plugins
 
             private void OnTriggerEnter(Collider col)
             {
-                if (col == null) return;
+                if (col == null || col.ObjectName() == "ZoneManager")
+                    return;
+
                 var entity = col.ToBaseEntity();
+                if (entity == null || entity.IsDestroyed)
+                    return;
 
-                if (entity is BaseMountable)
+                if (entity is BaseMountable m)
                 {
-                    var m = entity as BaseMountable;
+                    using var players = GetMountedPlayers(m);
 
-                    if (m.GetParentEntity() is TrainCar)
-                    {
-                        return;
-                    }
-
-                    RemoveMountable(m, GetMountedPlayers(m));
+                    RemoveMountable(m, players);
                 }
-                else if (entity is BasePlayer)
+                else if (entity is BasePlayer p)
                 {
-                    var p = entity as BasePlayer;
-
-                    if (_.InEvent(p) || _.IsSpectator(p))
+                    if (env.IsParticipant(p, true))
                     {
                         return;
                     }
 
                     RemovePlayer(p);
                 }
+                else if (IsCustomEntity(entity))
+                {
+                    RemoveMountable(entity, env._emptyPlayers);
+                }
             }
-
 
             public Vector3 GetEjectLocation(Vector3 a, float distance)
             {
-                var position = ((a.XZ3D() - _zonePos.XZ3D()).normalized * (ProtectionRadius + distance)) + _zonePos; // credits ZoneManager
-                float y = TerrainMeta.HighestPoint.y + 250f;
-
-                if (Physics.Raycast(position + new Vector3(0f, y, 0f), Vector3.down, out var hit, Mathf.Infinity, targetLayer, QueryTriggerInteraction.Ignore))
-                {
-                    position.y = hit.point.y + 0.75f;
-                }
-                else position.y = Mathf.Max(TerrainMeta.HeightMap.GetHeight(position), TerrainMeta.WaterMap.GetHeight(position)) + 0.75f;
-
+                Vector3 position = ((a.XZ3D() - LocationXZ3D).normalized * (ProtectionRadius + distance)) + Location; // credits ZoneManager
+                position.y = GetSpawnHeight(position, MaxY) + 0.75f;
                 return position;
             }
 
+            private bool CanBypass(BasePlayer player) => !env.config.Settings.removeAdmins && player.IsAdmin || !env.config.Settings.removeFlying && player.IsFlying;
+
             public bool RemovePlayer(BasePlayer player)
             {
-                if (!player.IsHuman() || player.IsAdmin)
+                if (!player.IsHuman() || CanBypass(player))
                 {
                     return false;
                 }
 
                 var m = player.GetMounted();
-
                 if (m.IsValid())
                 {
-                    var players = GetMountedPlayers(m);
+                    using var players = GetMountedPlayers(m);
+                    return RemoveMountable(m, players);
+                }
 
-                    players.RemoveAll(x => x == null || !x.IsHuman());
-
-                    if (RemoveMountable(m, players))
-                    {
-                        return true;
-                    }
+                var parent = player.GetParentEntity();
+                if (parent != null && IsCustomEntity(parent))
+                {
+                    return RemoveMountable(parent, env._emptyPlayers);
                 }
 
                 var position = GetEjectLocation(player.transform.position, 10f);
-
-                if (player.IsFlying)
+                if (player.IsFlying && player.transform.position.y > position.y)
                 {
                     position.y = player.transform.position.y;
                 }
@@ -1182,26 +1917,27 @@ namespace Oxide.Plugins
 
             public void DismountAllPlayers(BaseMountable m)
             {
-                foreach (var target in GetMountedPlayers(m))
+                using var players = GetMountedPlayers(m);
+
+                foreach (var player in players)
                 {
-                    if (target == null) continue;
+                    m.DismountPlayer(player, false);
 
-                    m.DismountPlayer(target, false);
-
-                    target.EnsureDismounted();
+                    player.EnsureDismounted();
                 }
             }
 
-            private List<BasePlayer> GetMountedPlayers(BaseMountable m)
+            private PooledList<BasePlayer> GetMountedPlayers(BaseMountable m)
             {
                 BaseVehicle vehicle = m.HasParent() ? m.VehicleParent() : m as BaseVehicle;
+                PooledList<BasePlayer> players = GetPooledList<BasePlayer>();
 
                 if (vehicle.IsValid())
                 {
-                    return GetMountedPlayers(vehicle);
+                    vehicle.GetMountedPlayers(players);
+                    players.RemoveAll(x => x == null || !x.IsHuman());
+                    return players;
                 }
-
-                List<BasePlayer> players = new();
 
                 var player = m.GetMounted();
 
@@ -1213,183 +1949,128 @@ namespace Oxide.Plugins
                 return players;
             }
 
-            private List<BasePlayer> GetMountedPlayers(BaseVehicle vehicle)
+            private static BaseEntity GetParentEntity(BaseEntity m)
             {
-                List<BasePlayer> players = new();
-
-                if (!vehicle.HasMountPoints())
+                int n = 0;
+                while (m != null && m.HasParent() && ++n < 30)
                 {
-                    var player = vehicle.GetMounted();
-
-                    if (player.IsValid() && player.IsHuman())
-                    {
-                        players.Add(player);
-                    }
-
-                    return players;
+                    if (!(m.GetParentEntity() is BaseEntity parent)) break;
+                    m = parent;
                 }
 
-                for (int i = 0; i < vehicle.mountPoints.Count; i++)
-                {
-                    var mountPoint = vehicle.mountPoints[i];
-
-                    if (mountPoint.mountable == null)
-                    {
-                        continue;
-                    }
-
-                    var player = mountPoint.mountable.GetMounted();
-
-                    if (player.IsValid() && player.IsHuman())
-                    {
-                        players.Add(player);
-                    }
-                }
-
-                return players;
-            }
-
-            private bool RemoveMountable(BaseMountable m, List<BasePlayer> players)
-            {
-                if (players.Count == 0)
-                {
-                    return EjectMountable(m, 10f, players);
-                }
-
-                BaseVehicle vehicle = m.HasParent() ? m.VehicleParent() : m as BaseVehicle;
-
-                if (!vehicle.IsKilled())
-                {
-                    var e = vehicle.transform.eulerAngles; // credits k1lly0u
-
-                    vehicle.transform.rotation = Quaternion.Euler(e.x, e.y - 180f, e.z);
-
-                    if (vehicle.rigidBody != null)
-                    {
-                        vehicle.rigidBody.velocity *= -1f;
-                    }
-
-                    return true;
-                }
-
-                return EjectMountable(m, 2f, players);
+                return m;
             }
 
             private bool IsFlying(BasePlayer player)
             {
-                return player?.modelState?.onground == false && TerrainMeta.HeightMap.GetHeight(player.transform.position) < player.transform.position.y - 1f;
+                return player != null && player.modelState != null && !player.modelState.onground && TerrainMeta.HeightMap.GetHeight(player.transform.position) < player.transform.position.y - 1f;
             }
 
-            private bool EjectMountable(BaseMountable m, float distance, List<BasePlayer> players)
+            private bool RemoveMountable(BaseEntity m, List<BasePlayer> players)
             {
-                if (m is BaseVehicle)
-                {
-                    var vehicle = m as BaseVehicle;
-
-                    foreach (var mp in vehicle.mountPoints)
-                    {
-                        if (mp.mountable.IsValid() && mp.mountable.GetMounted().IsValid())
-                        {
-                            if (mp.mountable.GetMounted().IsAdmin)
-                            {
-                                return false;
-                            }
-                        }
-                    }
-                }
-                else if (m.GetMounted().IsValid())
-                {
-                    if (m.GetMounted().IsAdmin)
-                    {
-                        return false;
-                    }
-                }
+                m = GetParentEntity(m);
+                if (m is ZiplineMountable or TrainCar { OwnerID: 0uL }) return false;
+                if (players.Exists(CanBypass)) return false;
 
                 var j = TerrainMeta.HeightMap.GetHeight(m.transform.position) - m.transform.position.y;
+                var distance = 10f + m.bounds.size.Max();
 
                 if (j > 5f)
                 {
                     distance += j;
                 }
 
-                var position = ((m.transform.position.XZ3D() - _zonePos.XZ3D()).normalized * (ProtectionRadius + distance)) + _zonePos;
-                var e = m.transform.eulerAngles;
+                var position = ((m.transform.position.XZ3D() - LocationXZ3D).normalized * (ProtectionRadius + distance)) + Location;
 
-                if (m is Minicopter || m is CH47Helicopter || players.Exists(player => IsFlying(player)))
+                if (m is BaseHelicopter or Parachute || players.Exists(IsFlying))
                 {
-                    position.y = Mathf.Max(m.transform.position.y + 5f, GetSpawnHeight(position) + 1f);
+                    position.y = Mathf.Max(m.transform.position.y + 5f, GetSpawnHeight(position, MaxY) + 1f);
                 }
                 else
                 {
-                    position.y = GetSpawnHeight(position) + 1f;
+                    position.y = GetSpawnHeight(position, MaxY) + 1f;
                 }
 
-                m.transform.rotation = Quaternion.Euler(e.x, e.y - 180f, e.z);
-
-                if (m.TryGetComponent(out Rigidbody rigidbody))
-                {
-                    rigidbody.velocity *= -1f;
-                }
-
-                if (m.mountAnchor != null && m.mountAnchor.transform != null)
-                {
-                    m.transform.position = m.mountAnchor.transform.position = position;
-                    m.mountAnchor.Rotate(m.transform.eulerAngles);
-                }
-                else m.transform.position = position;
-
-                m.TransformChanged();
+                MoveAndRotate(m, position);
 
                 return true;
             }
 
-            private int targetLayer = ~(Layers.Mask.Invisible | Layers.Mask.Trigger | Layers.Mask.Prevent_Movement | Layers.Mask.Prevent_Building); // credits ZoneManager
-
-            private static float GetSpawnHeight(Vector3 target)
+            private static void MoveAndRotate(BaseEntity entity, Vector3 position)
             {
-                float y = TerrainMeta.HeightMap.GetHeight(target);
-                float w = TerrainMeta.WaterMap.GetHeight(target);
-                float p = TerrainMeta.HighestPoint.y + 250f;
+                Rigidbody rb = entity is BaseVehicle vehicle ? vehicle.rigidBody : entity.GetComponent<Rigidbody>();
+                Quaternion yaw = Quaternion.AngleAxis(180f, Vector3.up);
+                Quaternion pitch = Quaternion.AngleAxis(10f, Vector3.left);
+                Quaternion rotation = yaw * entity.transform.rotation * pitch;
 
-                if (Physics.Raycast(new Vector3(target.x, w, target.z), Vector3.up, out var hit, p, Layers.Mask.World))
+                if (rb != null && !rb.isKinematic)
                 {
-                    y = Mathf.Max(y, hit.point.y);
-
-                    if (Physics.Raycast(new Vector3(target.x, hit.point.y + 0.5f, target.z), Vector3.up, out hit, p, Layers.Mask.World))
-                    {
-                        y = Mathf.Max(y, hit.point.y);
-                    }
+                    entity.transform.rotation = rotation;
+                    Vector3 v = yaw * new Vector3(rb.velocity.x, 0f, rb.velocity.z);
+                    rb.velocity = new Vector3(v.x, rb.velocity.y, v.z);
+                    rb.MovePosition(position);
+                    rb.MoveRotation(rotation);
                 }
-
-                return Mathf.Max(y, w);
+                else
+                {
+                    entity.transform.SetPositionAndRotation(position, rotation);
+                }
             }
 
             public void Setup(Vector3 position)
             {
                 transform.position = _zonePos = position;
-                _duelSpawns = _.GetAutoSpawns(this);
+                _zonePosXZ3D = position.XZ3D();
+                _duelSpawns = env.GetAutoSpawns(this);
 
-                if (_.removePlayers)
+                if (env.removePlayers)
                 {
-                    var collider = gameObject.GetComponent<SphereCollider>() ?? gameObject.AddComponent<SphereCollider>();
-                    collider.radius = ProtectionRadius + 1.5f;
-                    collider.isTrigger = true;
-                    collider.center = Vector3.zero;
-                    gameObject.layer = (int)Layer.Trigger;
+                    SetupCollider();
                 }
 
-                if (_.autoOvens || _.autoFlames || _.autoTurrets)
+                if (env.autoOvens || env.autoFlames || env.autoTurrets)
                 {
-                    var entities = new List<BaseCombatEntity>();
-                    Vis.Entities(_zonePos, ProtectionRadius, entities);
+                    using var entities = GetPooledList<BaseCombatEntity>();
+                    Vis.Entities(Location, ProtectionRadius, entities);
 
                     foreach (var e in entities)
                     {
-                        _.SetupPower(e);
+                        env.SetupPower(e);
                     }
                 }
 
                 CreateSpheres();
+            }
+
+            private void SetupCollider()
+            {
+                go.transform.position = Location;
+                go.layer = (int)Layer.Reserved1;
+
+                if (!go.TryGetComponent<SphereCollider>(out var collider))
+                {
+                    collider = go.AddComponent<SphereCollider>();
+                }
+
+                if (collider != null)
+                {
+                    collider.radius = ProtectionRadius;
+                    collider.isTrigger = true;
+                    collider.center = Vector3.zero;
+                }
+
+                if (!go.TryGetComponent<Rigidbody>(out var rigidbody))
+                {
+                    rigidbody = go.AddComponent<Rigidbody>();
+                }
+
+                if (rigidbody != null)
+                {
+                    rigidbody.isKinematic = true;
+                    rigidbody.useGravity = false;
+                    rigidbody.detectCollisions = true;
+                    rigidbody.collisionDetectionMode = CollisionDetectionMode.Discrete;
+                }
             }
 
             private void RemoveSpheres()
@@ -1399,178 +2080,471 @@ namespace Oxide.Plugins
 
             private void CreateSpheres()
             {
-                if (_.sphereAmount <= 0)
+                if (env.sphereAmount <= 0)
                 {
                     return;
                 }
 
-                var prefab = StringPool.Get(3211242734);
-
-                for (int i = 0; i < _.sphereAmount; i++)
+                for (int i = 0; i < env.sphereAmount; i++)
                 {
-                    var sphere = GameManager.server.CreateEntity(prefab, _zonePos) as SphereEntity;
+                    var sphere = GameManager.server.CreateEntity("assets/prefabs/visualization/sphere.prefab", Location) as SphereEntity;
 
                     if (sphere == null)
+                        continue;
+
+                    sphere.currentRadius = ProtectionRadius * 2f;
+                    sphere.lerpRadius = sphere.currentRadius;
+                    sphere.OwnerID = DUELIST_ID;
+                    sphere.enableSaving = false;
+                    sphere.Spawn();
+                    spheres.Add(sphere);
+                }
+            }
+
+            public SimpleBuildingBlock CreateZoneWall(string prefab, Vector3 pos, Quaternion rot, ulong ownerId, Vector3 center = default)
+            {
+                var e = GameManager.server.CreateEntity(prefab, pos, rot, false) as SimpleBuildingBlock;
+                if (e == null)
+                    return null;
+
+                if (center != Vector3.zero)
+                {
+                    e.transform.LookAt(center.WithY(pos.y), Vector3.up); // have each wall look at the center of the zone
+                    e.transform.Rotate(0f, 180f, 0f); // rotate the wall so the soft side faces inward
+                }
+
+                e.enableSaving = false;
+                e.OwnerID = ownerId;
+                e.Spawn();
+                e.gameObject.SetActive(true);
+                e.decay = null;
+                e.upkeepTimer = float.MinValue;
+                return e;
+            }
+
+            public void RemoveZoneWalls()
+            {
+                if (env.respawnWalls && env.Manager != null)
+                {
+                    env.Unsubscribe(nameof(OnEntityKill));
+                }
+                foreach (var entity in walls)
+                {
+                    entity.SafelyKill();
+                }
+                if (env.respawnWalls && env.Manager != null)
+                {
+                    env.Subscribe(nameof(OnEntityKill));
+                }
+                walls.Clear();
+            }
+
+            public void CreateZoneWalls(Vector3 center, float zoneRadius, string prefab, BasePlayer player = null)
+            {
+                if (!env.useZoneWalls)
+                    return;
+
+                var tick = DateTime.Now;
+                var yOverlap = 6f;
+                var maxDistance = 48f;
+                var maxHeight = -200f;
+                var minHeight = 200f;
+                var gap = prefab == heswPrefab ? 0.3f : 0.5f; // the distance used so that each wall fits closer to the other so players cannot throw items between the walls
+                var next1 = Mathf.CeilToInt(360 / zoneRadius * 0.1375f);
+                var next2 = 360 / zoneRadius - gap; // the distance apart each wall will be from the other
+
+                using var vectors1 = env.GetCircumferencePositions(center, zoneRadius, next1, 0f);
+                foreach (var position in vectors1) // get our positions and perform the calculations for the highest and lowest points of terrain
+                {
+                    if (Physics.Raycast(new Vector3(position.x, position.y + 200f, position.z), Vector3.down, out var hit, Mathf.Infinity, wallMask))
+                    {
+                        maxHeight = Mathf.Max(hit.point.y, maxHeight); // calculate the highest point of terrain
+                        minHeight = Mathf.Min(hit.point.y, minHeight); // calculate the lowest point of terrain
+                        center.y = minHeight; // adjust the spawn point of our walls to that of the lowest point of terrain
+                    }
+                }
+
+                int stacks = Mathf.CeilToInt((maxHeight - minHeight) / 6f) + env.extraWallStacks; // get the amount of walls to stack onto each other to go above the highest point
+                using var vectors2 = env.GetCircumferencePositions(center, zoneRadius, next2, center.y);
+                for (int i = 0; i < stacks; i++) // create our loop to spawn each stack
+                {
+                    float currentY = center.y + (i * yOverlap);
+
+                    if (currentY - center.y > maxDistance)
                     {
                         break;
                     }
 
-                    sphere.currentRadius = 1f;
-                    sphere.Spawn();
-                    sphere.LerpRadiusTo(ProtectionRadius * 2f, ProtectionRadius * 0.75f);
-                    spheres.Add(sphere);
+                    foreach (var v in vectors2) // get a list positions where each positions difference is the width of a high external stone wall. specify the height since we've already calculated what's required
+                    {
+                        Vector3 position = new(v.x, currentY, v.z);
+                        float terrainHeight = TerrainMeta.HeightMap.GetHeight(position);
+
+                        if (terrainHeight - currentY > yOverlap) // 0.1.13 improved distance check underground
+                            continue;
+
+                        if (env.useLeastAmount && position.y - terrainHeight > 6f + env.extraWallStacks * 6f)
+                            continue;
+
+                        if (env.useLeastAmount)
+                        {
+                            float j = stacks * yOverlap + yOverlap;
+
+                            if (position.y - terrainHeight > j && position.y < terrainHeight)
+                            {
+                                continue;
+                            }
+                        }
+
+                        SimpleBuildingBlock e = CreateZoneWall(prefab, position, Quaternion.identity, DUELIST_ID, center);
+                        if (e == null)
+                            continue;
+
+                        e.debrisPrefab.guid = null;
+                        e.canBeDemolished = false;
+                        e.Invoke("StopBeingDemolishable", 0f);
+                        walls.Add(e); // keep track of walls to delete when zone is destroyed, and serves as our counter too
+
+                        float fractionUnder = Mathf.Clamp01((terrainHeight - currentY) / yOverlap);
+
+                        if (fractionUnder > 0.2f)
+                        {
+                            FixNav(false, e); // 0.1.16 & 1.3.6: fix for npcs and explosives passing through walls
+                        }
+
+                        if (i == stacks - 1 && fractionUnder >= 0.6f)
+                        {
+                            stacks++;
+                            continue;
+                        }
+
+                        if (stacks == i - 1 && Physics.Raycast(new Vector3(v.x, v.y + 6.5f, v.z), Vector3.down, out var hit, 13f, worldMask))
+                        {
+                            if (hit.collider.ObjectName().Contains("rock") || hit.collider.ObjectName().Contains("formation", CompareOptions.OrdinalIgnoreCase))
+                            {
+                                stacks++; // 0.1.16 fix where rocks could allow a boost in or out of the top of a zone
+                            }
+                        }
+                    }
+                }
+
+                if (player == null) Puts(env.msg("GeneratedWalls", null, walls.Count, stacks, env.FormatPosition(center), (DateTime.Now - tick).TotalSeconds));
+                else Message(player, "GeneratedWalls", walls.Count, stacks, env.FormatPosition(center), (DateTime.Now - tick).TotalSeconds);
+                env.Subscribe(nameof(OnEntityTakeDamage));
+            }
+
+            private static void FixNav(bool frontier, SimpleBuildingBlock e)
+            {
+                MeshCollider mesh = e.GetComponentInChildren<MeshCollider>();
+                if (mesh == null || !e.TryGetComponent(out UnityEngine.AI.NavMeshObstacle nav))
+                {
+                    return;
+                }
+                if (frontier)
+                {
+                    nav.size = mesh.bounds.size * 1.1f;
+                    nav.center += nav.transform.InverseTransformDirection(new Vector3(0f, 2.25f, -0.5f));
+                }
+                else
+                {
+                    nav.size = nav.size.WithY(mesh.bounds.size.y);
+                    nav.center = e.transform.InverseTransformPoint(mesh.bounds.center);
                 }
             }
 
             public float Distance(Vector3 position)
             {
-                position.y = 0f;
-                return Vector3.Distance(new Vector3(_zonePos.x, 0f, _zonePos.z), position);
+                return (Location - position).MagnitudeXZ();
             }
 
-            public bool? AddWaiting(BasePlayer player, BasePlayer target)
+            public float SqrDistance(Vector3 position)
+            {
+                return (Location - position).SqrMagnitudeXZ();
+            }
+
+            public bool InRange(Vector3 position)
+            {
+                return SqrDistance(position) <= SqrProtectionRadius;
+            }
+
+            public SelectionResult GetSelectionResult(BasePlayer player, BasePlayer target, bool isQueued, bool isPaymentRequired, out bool isPaymentCompleted)
             {
                 if (IsFull)
-                    return false;
-
-                double requiredDuelMoney = _.requiredDuelMoney;
-
-                if (requiredDuelMoney > 0.0 && _.Economics.CanCall())
                 {
-                    double playerMoney = Convert.ToDouble(_.Economics.Call("Balance", (ulong)player.userID));
-                    double targetMoney = Convert.ToDouble(_.Economics.Call("Balance", (ulong)target.userID));
-
-                    if (playerMoney < _.requiredDuelMoney || targetMoney < requiredDuelMoney)
-                    {
-                        _.RemoveFromQueue(player.UserIDString);
-                        _.RemoveFromQueue(target.UserIDString);
-                        Message(player, _.msg("MoneyRequired", player.UserIDString, requiredDuelMoney));
-                        Message(target, _.msg("MoneyRequired", target.UserIDString, requiredDuelMoney));
-                        return null;
-                    }
-
-                    bool playerWithdrawn = Convert.ToBoolean(_.Economics.Call("Withdraw", (ulong)player.userID, requiredDuelMoney));
-                    bool targetWithdrawn = Convert.ToBoolean(_.Economics.Call("Withdraw", (ulong)target.userID, requiredDuelMoney));
-
-                    if (!playerWithdrawn || !targetWithdrawn)
-                    {
-                        _.RemoveFromQueue(player.UserIDString);
-                        _.RemoveFromQueue(target.UserIDString);
-                        return null;
-                    }
+                    isPaymentCompleted = false;
+                    return SelectionResult.Full;
                 }
 
-                _waiting.Add(player);
-                _waiting.Add(target);
+                var option = env.requiredDuelPaymentOption;
+                if (isPaymentRequired && option != null && option.IsEnabled())
+                {
+                    if (!HasPaymentBalance(option, player))
+                    {
+                        env.RemoveFromQueue(player.UserIDString);
+                        Message(player, "MoneyRequired", option.Amount);
+
+                        if (isQueued)
+                        {
+                            env.RemoveFromQueue(target.UserIDString);
+                            Message(target, "MoneyRequired", option.Amount);
+                        }
+
+                        isPaymentCompleted = false;
+                        return SelectionResult.PaymentRequired;
+                    }
+
+                    if (!HasPaymentBalance(option, target))
+                    {
+                        env.RemoveFromQueue(target.UserIDString);
+                        Message(target, "MoneyRequired", option.Amount);
+
+                        isPaymentCompleted = false;
+                        return SelectionResult.PaymentRequired;
+                    }
+
+                    TakePaymentBalance(option, player);
+                    TakePaymentBalance(option, target);
+                }
+
+                _waiting[player.UserIDString] = player;
+                _waiting[target.UserIDString] = target;
+
+                isPaymentCompleted = true;
+                return SelectionResult.Initiate;
+            }
+
+            private bool HasPaymentBalance(CustomCostOption option, BasePlayer player)
+            {
+                if (option.plugin == null)
+                {
+                    option.plugin = env.plugins.Find(option.PluginName);
+                }
+
+                if (option.plugin != null)
+                {
+                    double balance = 0;
+
+                    if (!string.IsNullOrWhiteSpace(option.ShoppyStockShopName))
+                    {
+                        balance = Convert.ToDouble(option.plugin?.Call(option.BalanceHookName, option.ShoppyStockShopName, option.PlayerDataType switch
+                        {
+                            2 => player,
+                            1 => player.UserIDString,
+                            0 or _ => (ulong)player.userID
+                        }));
+                    }
+                    else balance = Convert.ToDouble(option.plugin?.Call(option.BalanceHookName, option.PlayerDataType switch
+                    {
+                        2 => player,
+                        1 => player.UserIDString,
+                        0 or _ => (ulong)player.userID
+                    }));
+
+                    if (balance < option.Amount)
+                    {
+                        return false;
+                    }
+                }
 
                 return true;
             }
 
-            public bool IsWaiting(BasePlayer player)
+            private bool TakePaymentBalance(CustomCostOption option, BasePlayer buyer)
             {
-                return _waiting.Contains(player);
+                if (option.plugin == null)
+                {
+                    option.plugin = env.plugins.Find(option.PluginName);
+                }
+
+                if (option.plugin != null)
+                {
+                    if (!string.IsNullOrWhiteSpace(option.ShoppyStockShopName))
+                    {
+                        option.plugin?.Call(option.WithdrawHookName, option.ShoppyStockShopName, option.PlayerDataType switch
+                        {
+                            2 => buyer,
+                            1 => buyer.UserIDString,
+                            0 or _ => (ulong)buyer.userID
+                        }, option.AmountDataType switch
+                        {
+                            2 => (object)(int)option.Amount,
+                            1 => (object)(float)option.Amount,
+                            0 or _ => (object)(double)option.Amount
+                        });
+
+                        return true;
+                    }
+                    else
+                    {
+                        option.plugin?.Call(option.WithdrawHookName, option.PlayerDataType switch
+                        {
+                            2 => buyer,
+                            1 => buyer.UserIDString,
+                            0 or _ => (ulong)buyer.userID
+                        }, option.AmountDataType switch
+                        {
+                            2 => (object)(int)option.Amount,
+                            1 => (object)(float)option.Amount,
+                            0 or _ => (object)(double)option.Amount
+                        });
+
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            public bool RemoveWait(string playerId)
+            {
+                return _waiting.Remove(playerId);
             }
 
             public void AddPlayer(BasePlayer player)
             {
-                _waiting.Remove(player);
-                _players.Add(player);
+                _players[player.UserIDString] = player;
             }
 
             public void RemovePlayer(string playerId)
             {
-                _players.RemoveWhere(IsNull);
-
-                foreach (var player in _players)
+                if (_players.Remove(playerId))
                 {
-                    if (player.UserIDString == playerId)
-                    {
-                        _players.Remove(player);
-                        _waiting.Remove(player);
-                        break;
-                    }
+                    RemoveWait(playerId);
                 }
             }
 
             public bool HasPlayer(string playerId)
             {
-                return _players.Exists(player => player.UserIDString == playerId);
+                return _players.ContainsKey(playerId);
             }
 
             public void Kill()
             {
-                using var players = GetPool(_players);
+                using var players = GetPooledList(_players.Values);
                 foreach (var player in players)
-                    _.EjectPlayer(player);
+                    env.EjectPlayer(player);
 
-                foreach (var player in BasePlayer.allPlayerList)
+                using var targets = GetPlayerList(true);
+                foreach (var target in targets)
                 {
-                    if (Distance(player.transform.position) <= ProtectionRadius)
-                    {
-                        _.EndSpectate(player);
-                        _.SendHome(player);
-                    }
+                    if (Distance(target.transform.position) > ProtectionRadius)
+                        continue;
+
+                    env.EndSpectate(target);
+                    env.SendHome(target);
                 }
 
-                _.duelingZones.Remove(this);
+                foreach (var npc in npcs)
+                {
+                    if (npc == null) continue;
+                    BasePlayer.bots.Remove(npc);
+                    npc.DelayedSafeKill();
+                }
+
+                RemoveZoneWalls();
+                env.duelingZones.Remove(this);
                 _players.Clear();
                 RemoveSpheres();
-                Destroy(gameObject);
-                Destroy(this);
+                Destroy(go);
             }
         }
 
-        private object OnDangerousOpen(Vector3 treasurePos)
+        private class WorldExplosive : FacepunchBehaviour
         {
-            return DuelTerritory(treasurePos) ? (object)false : null;
+            public WorldItem worldItem;
+            private const float minExplosionRadius = 1f;
+            private const float explosionRadius = 5f;
+            private const int layers = 141568;
+
+            public void Init(WorldItem wi)
+            {
+                worldItem = wi;
+            }
+
+            private void OnDestroy()
+            {
+                if (worldItem != null && !worldItem.IsDestroyed)
+                {
+                    List<DamageTypeEntry> damageTypes = new()
+                    {
+                        new()
+                        {
+                            amount = 25f,
+                            type = DamageType.Explosion
+                        }
+                    };
+
+                    if (worldItem.OwnerID == 0uL) worldItem.OwnerID = DUELIST_ID;
+                    //Effect.server.Run("some resource", worldItem.PivotPoint(), worldItem.transform.forward, null, true);
+                    DamageUtil.RadiusDamage(worldItem, worldItem.LookupPrefab(), worldItem.CenterPoint(), minExplosionRadius, explosionRadius, damageTypes, layers, true);
+                }
+            }
         }
 
-        private object OnPlayerDeathMessage(BasePlayer victim, HitInfo info) // private plugin hook
+        public class DuelistNPC : ScientistNPC
         {
-            return DuelTerritory(victim.transform.position) ? (object)false : null;
+            public new DuelistBrain Brain;
+
+            public string DisplayNameOverride;
+
+            public new Translate.Phrase LootPanelTitle => DisplayNameOverride;
+
+            public override string Categorize() => "Duelist";
+
+            public override bool ShouldDropActiveItem() => false;
+
+            public override string displayName => DisplayNameOverride;
+
+            public override bool IsNpc => false;
+        }
+
+        public class DuelistBrain : ScientistBrain
+        {
+            internal string displayName;
+            internal string AttackName = string.Empty;
+            internal Transform NpcTransform;
+            internal IThinker thinker;
+            internal DuelistNPC npc;
+            internal Duelist Instance;
         }
 
         private void Init()
         {
-            Instance = this;
+            MaxTerrainY = 150f;
             SubscribeHooks(false); // turn off all hooks immediately
         }
 
         private void OnServerInitialized()
         {
-            LoadVariables();
+            RegisterCommands();
             SetupDefinitions();
 
-            monuments = new(UnityEngine.Object.FindObjectsOfType<MonumentInfo>().Select(monument => monument.transform.position));
-            duelsFile = Interface.Oxide.DataFileSystem.GetFile(Name);
-
-            try
+            foreach (var monument in UnityEngine.Object.FindObjectsOfType<MonumentInfo>())
             {
-                duelsData = duelsFile.ReadObject<StoredData>();
+                float radius = Mathf.Max(150f, monument.Bounds.size.Max());
+                monuments[monument.transform.position] = radius * radius;
             }
-            catch { }
 
-            if (duelsData == null)
-                duelsData = new();
+            try { data = Interface.Oxide.DataFileSystem.ReadObject<StoredData>(Name); } catch { }
+            if (data == null) data = new();
 
-            using var bets = GetPool(duelingBets);
-            foreach (var bet in bets) // 0.1.5 fix - check itemList after server has initialized
+            foreach (var bet in cfg_duelingBets) // 0.1.5 fix - check itemList after server has initialized
             {
-                if (ItemManager.GetItemDefinitions().Find(def => def.itemid == bet.itemid) == null)
+                if (ItemManager.FindItemDefinition(bet.itemid) == null)
                 {
                     Puts("Bet itemid {0} is invalid.", bet.itemid);
-                    duelingBets.Remove(bet);
                 }
+                else duelingBets.Add(bet);
             }
 
             if (useAnnouncement && announceTime > 0f)
                 announceTimer = timer.Repeat(announceTime, 0, () => DuelAnnouncement(false));
 
-            eventTimer = timer.Once(0.5f, CheckDuelistMortality); // kill players who haven't finished their duel in time. remove temporary immunity for duelers when it expires
+            eventTimer = timer.Every(0.5f, CheckDuelistMortality); // kill players who haven't finished their duel in time. remove temporary immunity for duelers when it expires
 
             if (!resetDuelists && BuildingManager.server.buildingDictionary.Count == 0)
             {
-                if (duelsData.VictoriesSeed.Count > 0 && duelsData.VictoriesSeed.Values.Exists(x => x > 0))
+                if (data.Get(Points.VictorySeed).Count > 0 && data.Get(Points.VictorySeed).Values.Exists(x => x > 0))
                 {
                     resetDuelists = true;
                 }
@@ -1588,28 +2562,29 @@ namespace Oxide.Plugins
                 ResetTemporaryData();
             }
 
-            if (ZoneManager.CanCall())
-                SetupZoneManager();
-
-            SetupZones();
+            SetupManagedZones();
+            SetupDuelZones();
 
             if (duelingZones.Count > 0 && autoEnable)
-                duelsData.DuelsEnabled = true;
+                data.DuelsEnabled = true;
 
             UpdateStability();
-            CheckZoneHooks(true);
+            CheckZoneHooks();
 
             if (guiAutoEnable)
             {
                 Subscribe(nameof(OnPlayerConnected));
 
-                foreach (var player in BasePlayer.activePlayerList)
-                    OnPlayerConnected(player);
+                using var targets = GetPlayerList();
+                foreach (var target in targets)
+                    OnPlayerConnected(target);
             }
 
             _allyCo = ServerMgr.Instance.StartCoroutine(SetupAllyEntitiesCo());
-            //if (useWorkshopSkins)
-            //webrequest.Enqueue("http://s3.amazonaws.com/s3.playrust.com/icons/inventory/rust/schema.json", null, GetWorkshopIDs, this, Core.Libraries.RequestMethod.GET);
+            InitializeDefinitions();
+
+            //if (useInvisibility) InitializeNetworking();
+            LoadOwnership();
         }
 
         private void OnServerSave()
@@ -1622,97 +2597,84 @@ namespace Oxide.Plugins
             resetDuelists = true;
         }
 
-        public void SaveData()
+        private object OnDangerousOpen(Vector3 treasurePos)
         {
-            if (duelsFile != null && duelsData != null)
-            {
-                duelsFile.WriteObject(duelsData);
-            }
+            return DuelTerritory(treasurePos) ? true : (object)null;
         }
 
-        private void DestroyAll()
+        private object OnPlayerDeathMessage(BasePlayer victim, HitInfo info) // private plugin hook
         {
-            using var zones = GetPool(duelingZones);
-            foreach (var zone in zones)
-            {
-                UnityEngine.Object.Destroy(zone.gameObject);
-            }
+            return DuelTerritory(victim.transform.position) ? true : (object)null;
         }
 
         private void Unload()
         {
-            if (_trackers != null)
-                foreach (var gameObj in _trackers)
-                    if (gameObj != null) UnityEngine.Object.Destroy(gameObj);
+            foreach (var obj in _trackers.Values)
+                if (obj != null) UnityEngine.Object.Destroy(obj);
 
             if (_allyCo != null)
                 ServerMgr.Instance.StopCoroutine(_allyCo);
 
             DestroyAll();
-            announceTimer?.Destroy();
             eventTimer?.Destroy();
+            announceTimer?.Destroy();
 
-            using var matches = GetPool(tdmMatches);
+            using var matches = GetPooledList(tdmMatches);
             foreach (var match in matches)
+            {
+                match.IsOver = true;
                 match.End();
+            }
 
-            using var zones = GetPool(duelingZones);
+            using var zones = GetPooledList(duelingZones);
             foreach (var zone in zones)
             {
                 RemoveEntities(zone);
                 zone.Kill();
             }
 
+            //if (useInvisibility)
+            //EntityDestroyOnClient();
+
             tdmMatches.Clear();
             duelingZones.Clear();
             ResetTemporaryData();
             DestroyAllUI();
-            Instance = null;
+            MaxTerrainY = 0f;
         }
 
         private void OnPlayerDisconnected(BasePlayer player, string reason)
         {
-            var match = GetMatch(player);
+            GetDeathmatch(player, out var match);
 
             if (match != null && !match.IsStarted && match.EitherEmpty)
                 match.End();
 
-            if (dataDuelists.ContainsKey(player.UserIDString))
+            string uid = player.UserIDString;
+            if (IsDuelist(uid))
             {
-                string uid = player.UserIDString;
-
-                if (!dcsBlock.Contains(uid))
-                {
-                    dcsBlock.Add(uid);
-                    timer.Once(60f, () => dcsBlock.Remove(uid));
-                }
-
-                OnDuelistLost(player, true);
-                RemoveDuelist(player.UserIDString);
-                ResetDuelist(player.UserIDString, false);
+                TryAddDisconnect(uid);
+                OnDuelistLost(player, true, false);
+                RemoveDuelist(uid);
+                ResetDuelist(uid, false);
             }
             else if (match != null && match.IsStarted && !match.IsOver)
             {
-                string uid = player.UserIDString;
-
-                if (!dcsBlock.Contains(uid))
-                {
-                    dcsBlock.Add(uid);
-                    timer.Once(60f, () => dcsBlock.Remove(uid));
-                }
-
+                TryAddDisconnect(uid);
+                match.RoundsLeft.Remove(uid);
                 player.inventory.Strip();
                 DefeatMessage(player, match);
                 match.CanRematch = false;
                 match.RemoveMatchPlayer(player);
             }
-            else if (IsSpectator(player))
+            else if (IsSpectating(player))
             {
+                TryAddDisconnect(uid);
                 EndSpectate(player);
                 SendHome(player);
             }
 
-            if (dataDuelists.Count == 0 && tdmMatches.Count == 0 && spectators.Count == 0)
+            if (!AnyParticipants())
                 Unsubscribe(nameof(OnPlayerDisconnected)); // nothing else to do right now, unsubscribe the hook
         }
 
@@ -1731,11 +2693,12 @@ namespace Oxide.Plugins
             cmdDUI(player, szUIChatCommand, Array.Empty<string>());
         }
 
-        private List<ulong> executes = new();
-
         private void OnPlayerSleepEnded(BasePlayer player) // setup the player
         {
-            if (IsDueling(player))
+            if (player == null)
+                return;
+            string playerId = player.UserIDString;
+            if (GetDuelist(player, out var dat))
             {
                 if (IsExploiting(player, true))
                 {
@@ -1744,120 +2707,92 @@ namespace Oxide.Plugins
 
                 foreach (var zone in duelingZones)
                 {
-                    if (zone.IsWaiting(player))
+                    if (zone.RemoveWait(playerId))
                     {
                         if (deathTime > 0)
                         {
-                            if (!executes.Contains(player.userID))
+                            if (!dataDeath.ContainsKey(playerId))
                             {
-                                Message(player, msg("ExecutionTime", player.UserIDString, deathTime));
-                                executes.Add(player.userID);
+                                Message(player, "ExecutionTime", deathTime);
                             }
 
-                            dataDeath[player.UserIDString] = TimeStamp() + deathTime * 60;
+                            dataDeath[playerId] = Time.time + deathTime * 60;
                         }
 
                         EndSpectate(player);
-                        GivePlayerKit(player);
-                        Track(player, true);
+                        player.equippingBlocked = true;
+                        GivePlayerKit(player, false);
+                        player.equippingBlocked = false; 
+                        SetEscapedEventTracker(player, true, true);
                         Metabolize(player, true);
 
-                        if (DestroyUI(player) && !createUI.Contains(player.UserIDString))
-                            createUI.Add(player.UserIDString);
+                        if (DestroyUI(player) && !createUI.Contains(playerId))
+                            createUI.Add(playerId);
 
                         CheckAutoReady(player);
                         zone.AddPlayer(player);
-                        Interface.Oxide.CallHook("EnableBypass", player.userID);
+
+                        if (useInvisibility)
+                            Disappear(player);
+
+                        Interface.Oxide.CallHook("EnableBypass", (ulong)player.userID);
+                        HolsterWeapon(player);
                     }
                 }
 
                 return;
             }
-            else if (InDeathmatch(player))
+            else if (GetDeathmatch(player, out var match))
             {
                 if (IsExploiting(player, false))
                 {
                     return;
                 }
 
-                var match = GetMatch(player);
-
                 if (deathTime > 0)
                 {
-                    Message(player, msg("ExecutionTime", player.UserIDString, deathTime));
-                    dataDeath[player.UserIDString] = TimeStamp() + deathTime * 60;
+                    if (match.RoundIndex <= 1) Message(player, "ExecutionTime", deathTime);
+                    dataDeath[playerId] = Time.time + deathTime * 60;
                 }
 
-                if (DestroyUI(player) && !createUI.Contains(player.UserIDString))
+                if (DestroyUI(player) && !createUI.Contains(playerId))
                 {
-                    createUI.Add(player.UserIDString);
+                    createUI.Add(playerId);
                 }
 
                 EndSpectate(player);
-                GivePlayerKit(player);
-                Track(player, true);
-                Metabolize(player, true);
+                player.equippingBlocked = true;
+                GivePlayerKit(player, true);
+                player.equippingBlocked = false;
                 match.GiveShirt(player);
+                SetEscapedEventTracker(player, true, false);
+                Metabolize(player, true);
                 CheckAutoReady(player);
-                Interface.Oxide.CallHook("EnableBypass", player.userID);
+
+                if (useInvisibility)
+                    Disappear(player);
+
+                Interface.Oxide.CallHook("EnableBypass", (ulong)player.userID);
+                HolsterWeapon(player);
                 return;
             }
             else SetPlayerTime(player, false);
 
-            if (announcements.ContainsKey(player.UserIDString))
+            if (announcements.Remove(playerId, out var announcement))
             {
-                CreateAnnouncementUI(player, announcements[player.UserIDString]);
-                announcements.Remove(player.UserIDString);
+                CreateAnnouncementUI(player, announcement);
             }
 
-            if (dataDuelists.Count == 0 && tdmMatches.Count == 0 && announcements.Count == 0)
+            if (!AnyParticipants() && announcements.Count == 0)
             {
                 // nothing else to do right now, unsubscribe the hook
                 Unsubscribe(nameof(OnPlayerSleepEnded));
             }
         }
 
-        private bool IsExploiting(BasePlayer player, bool duel)
-        {
-            if (AimTrain.CanCall() && Convert.ToBoolean(AimTrain?.Call("IsAimTraining", (ulong)player.userID)))
-            {
-                AimTrain?.Call("LeaveAimTrain", player);
-                DestroyUI(player);
-
-                if (duel)
-                {
-                    OnDuelistLost(player, true);
-                    RemoveDuelist(player.UserIDString);
-                    ResetDuelist(player.UserIDString, false);
-                    EndSpectate(player);
-                    SendHome(player);
-                }
-                else
-                {
-                    var match = GetMatch(player);
-
-                    if (match != null && !match.IsStarted && match.EitherEmpty)
-                    {
-                        match.End();
-                    }
-
-                    if (match != null && match.IsStarted && !match.IsOver)
-                    {
-                        DefeatMessage(player, match);
-                        match.CanRematch = false;
-                        match.RemoveMatchPlayer(player);
-                    }
-                }
-
-                return true;
-            }
-
-            return false;
-        }
-
         private void OnPlayerRespawned(BasePlayer player)
         {
-            if (DuelTerritory(player.transform.position) && !InEvent(player) && !spectators.Contains(player.UserIDString))
+            if (DuelTerritory(player.transform.position) && !IsParticipant(player, true))
             {
                 var spawnPoint = ServerMgr.FindSpawnPoint();
                 int retries = 25;
@@ -1871,107 +2806,49 @@ namespace Oxide.Plugins
 
         private void OnEntityKill(SimpleBuildingBlock e)
         {
-            if (respawnWalls)
+            if (!e.IsKilled() && e.ShortPrefabName.Contains("wall.external.high"))
             {
-                if (e?.transform != null && e.ShortPrefabName.Contains("wall.external.high"))
+                var zone = GetDuelZone(e.transform.position, 5f);
+
+                if (zone != null)
                 {
-                    RecreateZoneWall(e.PrefabName, e.transform.position, e.transform.rotation, e.OwnerID);
+                    zone.CreateZoneWall(e.PrefabName, e.transform.position, e.transform.rotation, e.OwnerID);
                 }
             }
         }
 
-        public void SetupPower(BaseEntity e)
+        private void OnEntityDeath(SimpleBuildingBlock entity, HitInfo info)
         {
-            if (autoOvens && e is BaseOven)
-            {
-                e.SetFlag(BaseEntity.Flags.On, true);
-            }
-            else if (autoFlames && e is FlameTurret)
-            {
-                var ft = e as FlameTurret;
+            if (entity == null || entity.IsDestroyed)
+                return;
 
-                if (!ft.HasFuel())
+            if (respawnWalls && entity.OwnerID == DUELIST_ID && entity.ShortPrefabName.Contains("wall.external.high"))
+            {
+                var zone = GetDuelZone(entity.transform.position, 5f);
+                if (zone != null)
                 {
-                    ft.inventory.AddItem(ItemManager.FindItemDefinition("lowgradefuel"), 5);
+                    zone.CreateZoneWall(entity.PrefabName, entity.transform.position, entity.transform.rotation, entity.OwnerID);
                 }
-
-                ft.fuelPerSec = 0f;
-            }
-            else if (autoTurrets && e is AutoTurret)
-            {
-                var at = e as AutoTurret;
-
-                at.InitiateStartup();
-                at.SetPeacekeepermode(false);
-            }
-        }
-
-        private List<Tracker> _trackers = new();
-        public void Track(BasePlayer player, bool enable)
-        {
-            if (enable && !player.TryGetComponent(out Tracker tracker))
-            {
-                tracker = player.gameObject.AddComponent<Tracker>();
-                tracker.Init(this);
-                _trackers.Add(tracker);
-            }
-            else if (!enable && player.TryGetComponent(out tracker))
-            {
-                _trackers.Remove(tracker);
-                UnityEngine.Object.Destroy(tracker);
-            }
-        }
-
-        public void RecreateZoneWall(string prefab, Vector3 pos, Quaternion rot, ulong ownerId)
-        {
-            if (DuelTerritory(pos) && duelsData.Zones.Exists(entry => GetOwnerId(entry.Key) == ownerId))
-                CreateZoneWall(prefab, pos, rot, ownerId);
-        }
-
-        public BaseEntity CreateZoneWall(string prefab, Vector3 pos, Quaternion rot, ulong ownerId)
-        {
-            var e = GameManager.server.CreateEntity(prefab, pos, rot, false);
-
-            if (e != null)
-            {
-                e.OwnerID = ownerId;
-                e.Spawn();
-                e.gameObject.SetActive(true);
-                return e;
-            }
-
-            return null;
-        }
-
-        private void OnEntityDeath(BaseEntity entity, HitInfo hitInfo) // 0.1.16 fix for player suiciding
-        {
-            if (entity == null)
-                return;
-
-            if (respawnWalls && entity.transform != null && entity.ShortPrefabName.Contains("wall.external.high"))
-            {
-                RecreateZoneWall(entity.PrefabName, entity.transform.position, entity.transform.rotation, entity.OwnerID);
                 return;
             }
-
-            var victim = entity as BasePlayer;
-
-            if (victim == null)
+        }
+        
+        private void OnEntityDeath(BasePlayer victim, HitInfo info) // 0.1.16 fix for player suiciding
+        {
+            if (victim == null || victim.IsDestroyed)
                 return;
 
-            if (spectators.Contains(victim.UserIDString))
+            if (IsSpectator(victim))
                 EndSpectate(victim);
 
             if (IsDueling(victim))
             {
                 victim.inventory.Strip();
-                OnDuelistLost(victim, true);
+                OnDuelistLost(victim, true, true);
             }
-            else if (InDeathmatch(victim))
+            else if (GetDeathmatch(victim, out var match))
             {
                 victim.inventory.Strip();
-                var match = GetMatch(victim);
-
                 DefeatMessage(victim, match);
                 match.RemoveMatchPlayer(victim);
             }
@@ -1979,365 +2856,67 @@ namespace Oxide.Plugins
 
         private void OnPlayerHealthChange(BasePlayer player, float oldValue, float newValue)
         {
-            if (newValue < 6f && player.IsHuman())
+            if (newValue < 6f && (player.IsHuman() || player is DuelistNPC))
             {
                 if (IsDueling(player))
                 {
                     player.health = 6f;
                     player.inventory.Strip();
-                    OnDuelistLost(player, false);
+                    OnDuelistLost(player, false, true);
                 }
-                else if (InDeathmatch(player))
+                else if (GetDeathmatch(player, out var match))
                 {
                     player.health = 6f;
                     player.inventory.Strip();
-
-                    var match = GetMatch(player);
                     DefeatMessage(player, match);
                     match.RemoveMatchPlayer(player);
                 }
             }
         }
 
-        private void DefeatMessage(BasePlayer victim, GoodVersusEvilMatch match)
+        private object OnEntityTakeDamage(BaseCombatEntity entity, HitInfo info)
         {
-            if (tdmAttackers.ContainsKey(victim.UserIDString))
-            {
-                var info = tdmAttackers[victim.UserIDString];
-
-                if (tdmServerDeaths || duelsData.ChatEx.Count > 0)
-                {
-                    foreach (var target in BasePlayer.activePlayerList.Where(p => p?.displayName != null))
-                    {
-                        if (duelsData.Chat.Contains(target.UserIDString) && target != victim)
-                            continue;
-
-                        Message(target, msg("MatchPlayerDefeated", target.UserIDString, victim.displayName, info.AttackerName, info.Weapon, info.BoneName, info.Distance));
-                    }
-                }
-                else if (tdmMatchDeaths)
-                    match.MessageAll("MatchPlayerDefeated", victim.displayName, info.AttackerName, info.Weapon, info.BoneName, info.Distance);
-
-                if (guiAnnounceUITime > 0f)
-                {
-                    if (sendDefeatedHome)
-                        announcements[victim.UserIDString] = msg("MatchPlayerDefeated", victim.UserIDString, victim.displayName, info.AttackerName, info.Weapon, info.BoneName, info.Distance);
-                    else
-                        CreateAnnouncementUI(victim, msg("MatchPlayerDefeated", victim.UserIDString, victim.displayName, info.AttackerName, info.Weapon, info.BoneName, info.Distance));
-                }
-
-                tdmAttackers.Remove(victim.UserIDString);
-                UpdateMatchStats(victim.UserIDString, false, false, true, false);
-                UpdateMatchStats(info.AttackerId, false, false, false, true);
-            }
-        }
-
-        private void OnDuelistLost(BasePlayer victim, bool sendHome)
-        {
-            RemoveEntities(victim.userID);
-            var victimId = victim.UserIDString;
-
-            if (!dataDuelists.TryGetValue(victimId, out string attackerId))
-            {
-                NextTick(() => SendHome(victim));
-                return;
-            }
-
-            var attacker = BasePlayer.Find(attackerId);
-            string attackerName = attacker?.displayName ?? GetDisplayName(attackerId); // get the attackers name. null check for self inflicted
-
-            dataDeath.Remove(victimId); // remove them from automatic deaths
-            dataDeath.Remove(attackerId);
-            dataDuelists.Remove(victimId); // unset their status as duelers
-            dataDuelists.Remove(attackerId);
-            victim.inventory.Strip();
-            Metabolize(victim, false);
-            Track(victim, false);
-
-            if (!duelsData.LossesSeed.TryGetValue(victimId, out int value)) duelsData.LossesSeed.Add(victimId, 1);
-            else duelsData.LossesSeed[victimId] = ++value;
-            if (!duelsData.Losses.TryGetValue(victimId, out int value2)) duelsData.Losses.Add(victimId, 1);
-            else duelsData.Losses[victimId] = ++value2;
-            if (!duelsData.VictoriesSeed.TryGetValue(attackerId, out int value3)) duelsData.VictoriesSeed.Add(attackerId, 1);
-            else duelsData.VictoriesSeed[attackerId] = ++value3;
-            if (!duelsData.Victories.TryGetValue(attackerId, out int value4)) duelsData.Victories.Add(attackerId, 1);
-            else duelsData.Victories[attackerId] = ++value4;
-            duelsData.TotalDuels++;
-
-            int victimLossesSeed = duelsData.LossesSeed[victimId];
-            int victimVictoriesSeed = duelsData.VictoriesSeed.TryGetValue(victimId, out int value5) ? value5 : 0;
-            int attackerLossesSeed = duelsData.LossesSeed.TryGetValue(attackerId, out int value6) ? value6 : 0;
-            int attackerVictoriesSeed = duelsData.VictoriesSeed[attackerId];
-            var bet = duelsData.Bets.TryGetValue(attackerId, out var value7) && duelsData.Bets.TryGetValue(victimId, out var value8) && value7.Equals(value8) && !IsAllied(victim, attacker) ? value7 : null; // victim bet his attacker and lost, use later to add a claim for the attacker
-
-            Puts(RemoveFormatting(msg("DuelDeathMessage", null, attackerName, attackerVictoriesSeed, attackerLossesSeed, victim.displayName, victimVictoriesSeed, victimLossesSeed, Math.Round(attacker?.health ?? 0f, 2), bet != null ? msg("BetWon", null, bet.trigger, bet.amount) : string.Empty))); // send message to console
-            Interface.CallHook("OnDuelistDefeated", attacker, victim);
-
-            if (guiAnnounceUITime > 0f)
-            {
-                if (sendDefeatedHome)
-                {
-                    announcements[victimId] = msg("DuelDeathMessage", victimId, attackerName, attackerVictoriesSeed, attackerLossesSeed, victim.displayName, victimVictoriesSeed, victimLossesSeed, Math.Round(attacker?.health ?? 0f, 2), bet != null ? msg("BetWon", null, bet.trigger, bet.amount) : string.Empty);
-                    announcements[attackerId] = msg("DuelDeathMessage", attackerId, attackerName, attackerVictoriesSeed, attackerLossesSeed, victim.displayName, victimVictoriesSeed, victimLossesSeed, Math.Round(attacker?.health ?? 0f, 2), bet != null ? msg("BetWon", null, bet.trigger, bet.amount) : string.Empty);
-                }
-                else
-                {
-                    CreateAnnouncementUI(victim, msg("DuelDeathMessage", victimId, attackerName, attackerVictoriesSeed, attackerLossesSeed, victim.displayName, victimVictoriesSeed, victimLossesSeed, Math.Round(attacker?.health ?? 0f, 2), bet != null ? msg("BetWon", null, bet.trigger, bet.amount) : string.Empty));
-                    CreateAnnouncementUI(attacker, msg("DuelDeathMessage", attackerId, attackerName, attackerVictoriesSeed, attackerLossesSeed, victim.displayName, victimVictoriesSeed, victimLossesSeed, Math.Round(attacker?.health ?? 0f, 2), bet != null ? msg("BetWon", null, bet.trigger, bet.amount) : string.Empty));
-                }
-            }
-
-            foreach (var target in BasePlayer.activePlayerList)
-            {
-                if (target == null || target.displayName == null || duelsData.Chat.Contains(target.UserIDString) && target != victim && target != attacker)
-                    continue;
-
-                if (!broadcastDefeat && !duelsData.ChatEx.Contains(target.UserIDString) && target != victim && target != attacker)
-                    continue;
-
-                string betWon = bet != null ? msg("BetWon", target.UserIDString, bet.trigger, bet.amount) : string.Empty;
-                Message(target, msg("DuelDeathMessage", target.UserIDString, attackerName, attackerVictoriesSeed, attackerLossesSeed, victim.displayName, victimVictoriesSeed, victimLossesSeed, Math.Round(attacker?.health ?? 0f, 2), betWon));
-            }
-
-            if (bet != null && attacker != null) // award the bet to the attacker
-            {
-                var claimBet = new BetInfo
-                {
-                    itemid = bet.itemid,
-                    amount = bet.amount * 2,
-                    trigger = bet.trigger
-                };
-
-                if (!duelsData.ClaimBets.ContainsKey(attackerId))
-                    duelsData.ClaimBets.Add(attackerId, new());
-
-                duelsData.ClaimBets[attackerId].Add(claimBet);
-                duelsData.Bets.Remove(attackerId);
-                duelsData.Bets.Remove(victimId);
-                Puts(msg("ConsoleBetWon", null, attacker.displayName, attacker.UserIDString, victim.displayName, victimId));
-                Message(attacker, msg("NotifyBetWon", attacker.UserIDString, szDuelChatCommand));
-            }
-
-            ulong attackeruId = Convert.ToUInt64(attackerId);
-            var attackerZone = RemoveDuelist(attackerId);
-            RemoveEntities(attackeruId);
-            AwardPlayer(attackerId, economicsMoney, serverRewardsPoints);
-
-            Interface.Oxide.CallHook("DisableBypass", victim.userID.Get());
-            Interface.Oxide.CallHook("DisableBypass", attackeruId);
-
-            if (attacker != null)
-            {
-                attacker.inventory.Strip();
-                Metabolize(attacker, false);
-                Track(attacker, false);
-            }
-
-            var victimZone = RemoveDuelist(victimId);
-            if (attackerZone == null) attackerZone = victimZone;
-
-            if (zoneCounter > 0 && attackerZone != null) // if new zones are set to spawn every X duels then increment by 1
-            {
-                if (++attackerZone.Kills >= zoneCounter && attackerZone.TotalPlayers == 0)
-                {
-                    RemoveDuelZone(attackerZone);
-                    SetupDuelZone(null, GetZoneName(null, zoneRadius)); // x amount of duels completed. time to relocate and start all over! changing the dueling zones location keeps things mixed up and entertaining for everyone. especially when there's issues with terrain
-                    SaveData();
-                }
-            }
-
-            if (dataDuelists.Count == 0 && tdmMatches.Count == 0)
-                Unsubscribe(nameof(OnPlayerHealthChange));
-
-            if (sendHome || dcsBlock.Contains(victimId))
-            {
-                NextTick(() =>
-                {
-                    SendHome(attacker);
-                    SendHome(victim);
-                });
-
-                if (dcsBlock.Contains(victimId))
-                    return;
-            }
-
-            if (attacker != null)
-            {
-                if (victim.IsConnected && attacker.IsConnected)
-                {
-                    var rematch = new Rematch(this);
-                    rematches.Add(rematch);
-                    rematch.Duelists.Add(attacker);
-                    rematch.Duelists.Add(victim);
-                    rematch.Notify();
-                }
-
-                if (!sendHome && !InEvent(attacker) && !InEvent(victim))
-                {
-                    StartSpectate(attacker);
-                    StartSpectate(victim);
-                }
-            }
-        }
-
-        public DuelZone GetZoneName(string name, float radius)
-        {
-            name ??= (duelsData.Zones.Count + 1).ToString();
-            return new(name, radius);
-        }
-
-        public void SendDuelistsHome()
-        {
-            using var duelists = GetPool(dataDuelists.Keys);
-            foreach (var userid in duelists)
-            {
-                if (duelsData.Homes.ContainsKey(userid))
-                {
-                    var target = BasePlayer.Find(userid);
-
-                    if (target != null && DuelTerritory(target.transform.position))
-                    {
-                        target.inventory.Strip();
-                        SendHome(target);
-                    }
-                }
-
-                ResetDuelist(userid);
-            }
-        }
-
-        public void SendSpectatorsHome()
-        {
-            foreach (var player in BasePlayer.activePlayerList)
-            {
-                if (IsSpectator(player))
-                {
-                    EndSpectate(player);
-                }
-            }
-        }
-
-        private void StartSpectate(BasePlayer player)
-        {
-            if (IsNotConnected(player))
-                return;
-
-            if (GetDuelZone(player.transform.position) == null)
-            {
-                SendHome(player);
-                return;
-            }
-
-            if (!player.CanInteract())
-            {
-                if (player.IsDead())
-                    player.RespawnAt(player.transform.position, default(Quaternion));
-
-                timer.Once(1f, () => StartSpectate(player));
-                return;
-            }
-
-            spectators.Add(player.UserIDString);
-            Message(player, msg("BeginSpectating", player.UserIDString));
-            player.inventory.Strip();
-            player.health = 100f;
-            player.metabolism.bleeding.value = 0f;
-            player.StopWounded();
-            CreateDefeatUI(player);
-        }
-
-        private void EndSpectate(BasePlayer player)
-        {
-            CuiHelper.DestroyUi(player, "DuelistUI_Defeat");
-
-            if (spectators.Contains(player.UserIDString))
-            {
-                if (playerHealth > 0f && player.IsAlive())
-                    player.health = playerHealth;
-
-                spectators.Remove(player.UserIDString);
-                player.SendNetworkUpdate();
-                Message(player, msg("EndSpectating", player.UserIDString));
-            }
-        }
-
-        private static bool IsNull(BaseNetworkable a) => a == null || a.IsDestroyed;
-
-        private static bool IsNotConnected(BasePlayer a) => a == null || a.IsDestroyed || !a.IsConnected;
-
-        public void HealDamage(BaseCombatEntity entity)
-        {
-            timer.Once(1f, () =>
-            {
-                if (!entity.IsKilled() && entity.health < entity.MaxHealth())
-                {
-                    entity.health = entity.MaxHealth();
-                    entity.SendNetworkUpdate();
-                }
-            });
-        }
-
-        public void CancelDamage(HitInfo hitInfo)
-        {
-            if (hitInfo != null)
-            {
-                hitInfo.damageTypes?.Clear();
-                hitInfo.DidHit = false;
-                hitInfo.DoHitEffects = false;
-            }
-        }
-
-        private object OnEntityTakeDamage(BaseCombatEntity entity, HitInfo hitInfo)
-        {
-            if (entity.IsKilled() || entity.net == null || entity is BaseNpc)
+            if (entity.IsKilled() || entity is BaseNpc or BaseNPC2)
                 return null;
 
-            if (DuelTerritory(entity.transform.position, 1f))
+            if (entity.OwnerID == DUELIST_ID)
             {
-                if (entity is BuildingBlock || entity.name.Contains("deploy") || entity.name.Contains("wall.external.high") || entity.name.Contains("building"))
-                {
-                    CancelDamage(hitInfo);
-                    HealDamage(entity);
-                    return true;
-                }
+                SafelyHeal(entity);
+                CancelDamage(info);
+                return true;
             }
 
-            if (hitInfo == null || hitInfo.Initiator.IsKilled() || !hitInfo.hasDamage)
+            if (info == null || info.Initiator.IsKilled() || !info.hasDamage)
                 return null;
 
-            var victim = entity as BasePlayer;
-            var attacker = hitInfo.Initiator as BasePlayer;
-            var pointStart = hitInfo.Initiator?.transform?.position ?? hitInfo.PointStart; // 0.1.6 border fix
-            var pointEnd = entity.transform.position;
-            bool adt = DuelTerritory(pointStart);
-            bool vdt = DuelTerritory(pointEnd);
+            BasePlayer victim = entity as BasePlayer;
+            BasePlayer attacker = info.Initiator as BasePlayer;
+            bool isVic = !victim.IsKilled();
+            bool isAtk = !attacker.IsKilled();
+            bool vdt = DuelTerritory(entity.transform.position);
+            bool adt = DuelTerritory(info.Initiator.transform.position);
+            bool avdt = vdt || adt;
 
             if (adt && entity is PatrolHelicopter)
                 return true;
 
-            if (vdt && victim?.transform != null && hitInfo.Initiator != null && hitInfo.Initiator.ShortPrefabName.Contains("wall.external.high")) // 1.0.2 - exploit fix
+            if (vdt && isVic && info.Initiator is SimpleBuildingBlock) // 1.0.2 - exploit fix
                 return true;
 
-            if (victim != null && victim.transform != null && attacker != null && victim == attacker) // allow player to suicide and self inflict
+            if (isVic && isAtk && victim == attacker) // allow player to suicide and self inflict
             {
-                if (hitInfo.damageTypes.Has(DamageType.Suicide) && InEvent(victim))
+                if (info.damageTypes.Has(DamageType.Suicide) && IsParticipant(victim))
                 {
-                    string uid = victim.UserIDString;
-
-                    if (!dcsBlock.Contains(uid))
-                    {
-                        dcsBlock.Add(uid);
-                        timer.Once(60f, () => dcsBlock.Remove(uid));
-                    }
+                    TryAddSuicide(victim.UserIDString);
                 }
 
                 return null;
             }
 
-            if (victim != null && hitInfo.damageTypes.GetMajorityDamageType() == DamageType.Fall && !dataImmunity.ContainsKey(victim.UserIDString))
+            if (isVic && info.damageTypes.GetMajorityDamageType() == DamageType.Fall && !UserHasImmunity(victim.UserIDString))
                 return null;
 
-            if (attacker?.transform != null && spectators.Contains(attacker.UserIDString)) // 0.1.27: someone will find a way to abuse spectate mode so we'll prevent that now
+            if (isAtk && spectators.Contains(attacker.UserIDString)) // 0.1.27: someone will find a way to abuse spectate mode so we'll prevent that now
             {
                 if (!adt)
                 {
@@ -2345,79 +2924,71 @@ namespace Oxide.Plugins
                     SendHome(attacker);
                 }
 
-                CancelDamage(hitInfo);
+                CancelDamage(info);
                 return true;
             }
 
-            if ((adt || vdt) && !hitInfo.Initiator.IsKilled() && hitInfo.Initiator.IsNpc) // 1.2.0
+            if (avdt) // 1.2.0
             {
-                if (hitInfo.Initiator is BaseNpc)
+                if (info.Initiator is BaseNpc animal)
                 {
-                    var npc = hitInfo.Initiator as BaseNpc;
-
-                    if (npc != null)
+                    if (animal != null)
                     {
                         if (putToSleep)
                         {
-                            npc.SetAiFlag(BaseNpc.AiFlags.Sleeping, true);
-                            npc.CurrentBehaviour = BaseNpc.Behaviour.Sleep;
+                            animal.SetAiFlag(BaseNpc.AiFlags.Sleeping, true);
+                            animal.CurrentBehaviour = BaseNpc.Behaviour.Sleep;
                         }
                         else if (killNpc)
                         {
-                            npc.Kill();
+                            animal.Kill();
                         }
 
                         return true;
                     }
                 }
-                else if (hitInfo.Initiator is BasePlayer)
+                else if (info.Initiator is BaseNPC2 npc2)
                 {
-                    var npc = hitInfo.Initiator as BasePlayer;
-
-                    if (npc != null)
+                    if (killNpc) npc2.Kill();
+                    return true;
+                }
+                else if (info.Initiator is BasePlayer npc && !npc.userID.IsSteamId())
+                {
+                    if (npc is global::HumanNPC human)
                     {
-                        if (npc is global::HumanNPC)
-                        {
-                            (npc as global::HumanNPC).LootSpawnSlots = Array.Empty<LootContainer.LootSpawnSlot>();
-                        }
-
-                        npc.Kill();
-                        CancelDamage(hitInfo);
-                        return true;
+                        human.LootSpawnSlots = Array.Empty<LootContainer.LootSpawnSlot>();
                     }
+
+                    npc.Kill();
+                    CancelDamage(info);
+                    return true;
                 }
             }
 
-            if (dataDuelists.Count > 0)
+            if (_duelists.Count > 0)
             {
-                if (attacker?.transform != null && IsDueling(attacker) && victim != null && dataDuelists[attacker.UserIDString] != victim.UserIDString) // 0.1.8 check attacker then victim
+                if (isAtk && isVic && GetDuelist(attacker, out var attackerData) && attackerData.ID != victim.UserIDString) // 0.1.8 check attacker then victim
                     return true; // prevent attacker from doing damage to others
 
-                if (victim?.transform != null && IsDueling(victim)) // 1.2.0 NRE get_transform
+                if (isVic && GetDuelist(victim, out var victimData)) // 1.2.0 NRE get_transform
                 {
                     if (victim.health == 6f)
-                        return true;
-
-                    if (dataImmunity.ContainsKey(victim.UserIDString))
+                        return true; // don't let the player die, match will complete without the annoyance of death
+                    if (UserHasImmunity(victim.UserIDString))
                         return true; // immunity timer
-
-                    if (hitInfo.Initiator is PatrolHelicopter)
+                    if (info.Initiator is PatrolHelicopter)
                         return true; // protect duelers from helicopters
-
-                    if (attacker?.transform != null && dataDuelists[victim.UserIDString] != attacker.UserIDString)
-                        return true; // prevent attacker from doing damage to others
-
-                    hitInfo.damageTypes.ScaleAll(damageScaleAmount);
+                    if (isAtk && victimData.ID != attacker.UserIDString)
+                        return true; // prevent either attacker from doing damage to others
+                    info.damageTypes.ScaleAll(damageScaleAmount);
                     return null;
                 }
             }
 
             if (tdmMatches.Count > 0)
             {
-                if (victim != null && attacker?.transform != null && InDeathmatch(attacker))
+                if (isVic && isAtk && GetDeathmatch(attacker, out var match))
                 {
-                    var match = GetMatch(attacker);
-
                     if (match.GetTeam(victim) == Team.None)
                         return true;
 
@@ -2425,53 +2996,50 @@ namespace Oxide.Plugins
                         return true; // FF
                 }
 
-                if (victim?.transform != null && InDeathmatch(victim))
+                if (isVic && InDeathmatch(victim))
                 {
-                    if (dataImmunity.ContainsKey(victim.UserIDString))
+                    if (UserHasImmunity(victim.UserIDString))
                         return true;
 
-                    if (hitInfo.Initiator is PatrolHelicopter)
+                    if (info.Initiator is PatrolHelicopter)
                         return true;
 
-                    if (attacker?.transform != null)
+                    if (isAtk)
                     {
-                        if (GetMatch(attacker) == null)
+                        if (!InDeathmatch(attacker))
                             return true;
 
                         if (victim.health == 6f)
                             return true;
 
-                        if (tdmAttackers.ContainsKey(victim.UserIDString))
-                            tdmAttackers.Remove(victim.UserIDString);
+                        if (!tdmAttackers.TryGetValue(victim.UserIDString, out var p))
+                            tdmAttackers[victim.UserIDString] = p = new();
 
-                        string weapon = attacker.GetActiveItem()?.info?.displayName?.english ?? hitInfo?.WeaponPrefab?.ShortPrefabName ?? "??";
-
-                        if (weapon.EndsWith(".entity"))
-                        {
-                            var def = ItemManager.FindItemDefinition(weapon.Replace(".entity", string.Empty).Replace("_", "."));
-                            weapon = def?.displayName.translated ?? weapon.Replace(".entity", string.Empty).Replace("_", string.Empty).SentenceCase();
-                        }
-
-                        AttackerInfo p = new();
-                        tdmAttackers[victim.UserIDString] = p;
                         p.AttackerName = attacker.displayName;
                         p.AttackerId = attacker.UserIDString;
-                        p.Distance = Math.Round(Vector3.Distance(attacker.transform.position, victim.transform.position), 2).ToString();
-                        p.BoneName = FormatBone(hitInfo.boneName).TrimEnd(); //StringPool.Get(hitInfo.boneName)
-                        p.Weapon = weapon;
+                        p.Distance = $"{(attacker.transform.position - victim.transform.position).magnitude:N2}";
+                        p.BoneName = info.boneName ?? info.boneArea.ToString();
+                        p.def = attacker.GetActiveItem()?.info;
+                        p.Weapon = p?.def?.displayName?.english ?? info?.WeaponPrefab?.ShortPrefabName ?? "??";
+
+                        if (p.Weapon.EndsWith(".entity"))
+                        {
+                            p.def = ItemManager.FindItemDefinition(p.Weapon.Replace(".entity", string.Empty).Replace("_", "."));
+                            p.Weapon = p.def?.displayName.translated ?? p.Weapon.Replace(".entity", string.Empty).Replace("_", string.Empty).SentenceCase();
+                        }
                     }
 
-                    hitInfo.damageTypes.ScaleAll(damageScaleAmount);
+                    info.damageTypes.ScaleAll(damageScaleAmount);
                     return null;
                 }
             }
 
-            if (victim?.transform != null && attacker?.transform != null) // 1.1.1 - fix for players standing on the edge of a zone for protection
+            if (isVic && isAtk) // 1.1.1 - fix for players standing on the edge of a zone for protection
             {
-                if (vdt && !InEvent(victim))
+                if (vdt && !IsParticipant(victim.UserIDString))
                     return null;
 
-                if (adt && !InEvent(attacker))
+                if (adt && !IsParticipant(attacker.UserIDString))
                     return null;
             }
 
@@ -2484,58 +3052,75 @@ namespace Oxide.Plugins
             return null;
         }
 
-        private object OnRestoreUponDeath(BasePlayer player)
+        private object CanRevivePlayer(BasePlayer player, Vector3 pos)
         {
-            if (DuelTerritory(player.transform.position))
-            {
-                return InEvent(player) ? true : (object)null;
-            }
-            return null;
+            return InEvent(player) ? true : (object)null;
         }
 
-        class Explosives : FacepunchBehaviour
+        private object OnLifeSupportSavingLife(BasePlayer player)
         {
-            WorldItem worldItem;
-            float minExplosionRadius = 1f;
-            float explosionRadius = 5f;
-            int layers = 141568;
+            return InEvent(player) ? true : (object)null;
+        }
 
-            void Awake()
-            {
-                worldItem = GetComponent<WorldItem>();
-            }
-
-            void OnDestroy()
-            {
-                var damageTypes = new List<DamageTypeEntry>
-                {
-                    new()
-                    {
-                        amount = 25f,
-                        type = DamageType.Explosion
-                    }
-                };
-
-                //Effect.server.Run("some resource", worldItem.PivotPoint(), worldItem.transform.forward, null, true);
-                DamageUtil.RadiusDamage(worldItem, worldItem.LookupPrefab(), worldItem.CenterPoint(), minExplosionRadius, explosionRadius, damageTypes, layers, true);
-                Destroy(this);
-            }
+        private object OnRestoreUponDeath(BasePlayer player)
+        {
+            return InEvent(player) ? true : (object)null;
         }
 
         private void OnEntitySpawned(WorldItem worldItem)
         {
+            if (worldItem.IsKilled() || !DuelTerritory(worldItem.transform.position))
+                return;
             NextTick(() =>
             {
-                if (!worldItem.IsKilled() && worldItem.item != null && worldItem.item.info.shortname == "arrow.bone" && DuelTerritory(worldItem.transform.position, -2f))
+                if (!worldItem.IsKilled() && worldItem.item != null && worldItem.item.info.shortname == "arrow.bone")
                 {
-                    worldItem.gameObject.AddComponent<Explosives>();
+                    worldItem.gameObject.AddComponent<WorldExplosive>().Init(worldItem);
                 }
             });
+            if (data.Homes.Count > 0)
+            {
+                NextTick(() => // prevent rpc kick by using NextTick since we're also hooking OnItemDropped
+                {
+                    if (!worldItem.IsKilled()) // we must check this or you will still be rpc kicked
+                    {
+                        if (worldItem != null && worldItem.item != null && !IsThrownWeapon(worldItem.item)) // allow thrown weapons / destroy items which are dropped by players and on death
+                            worldItem.Kill();
+                    }
+                });
+
+                if (!worldItem.IsKilled())
+                {
+                    timer.Repeat(0.1f, 20, () => // track the item to make sure it wasn't thrown out of the dueling zone
+                    {
+                        if (!worldItem.IsKilled() && !DuelTerritory(worldItem.transform.position))
+                            worldItem.Kill(); // destroy items which are dropped from inside to outside of the zone
+                    });
+                }
+            }
+
+            //void SafelyRemoveBackpack(DroppedItemContainer c)
+            //{
+            //    List<string> duelers = new List<string>();
+            //    GetAllDuelers(duelers);
+            //    ServerMgr.Instance.Invoke(() =>
+            //    {
+            //        if (c != null && duelers.Contains(c.playerSteamID.ToString()))
+            //        {
+            //            c.SafelyKill();
+            //        }
+            //    }, 0.1f);
+            //}
         }
 
         private void OnEntitySpawned(BaseEntity entity)
         {
-            if (entity == null || entity.IsDestroyed || !DuelTerritory(entity.transform.position))
+            if (entity == null || entity.IsDestroyed)
+                return;
+
+            var position = entity.transform.position;
+            var zone = GetDuelZone(position, 5f);
+            if (zone == null)
                 return;
 
             if (entity.IsNpc)
@@ -2559,16 +3144,18 @@ namespace Oxide.Plugins
                 }
             }
 
-            if (dataDuelists.Count == 0 && tdmMatches.Count == 0)
+            if (!AnyParticipants())
+            {
                 return;
+            }
 
             if (prefabs.ContainsKey(entity.PrefabName))
             {
-                if (entity.name.Contains("barricade."))
+                if (entity.PrefabName.Contains("barricade."))
                 {
                     if (morphBarricadesStoneWalls || morphBarricadesWoodenWalls)
                     {
-                        var wall = CreateZoneWall(morphBarricadesStoneWalls ? heswPrefab : hewwPrefab, entity.transform.position, entity.transform.rotation, entity.OwnerID);
+                        var wall = zone.CreateZoneWall(morphBarricadesStoneWalls ? heswPrefab : hewwPrefab, position, entity.transform.rotation, entity.OwnerID);
 
                         if (wall != null)
                         {
@@ -2578,7 +3165,6 @@ namespace Oxide.Plugins
                                 duelEntities.Add(wall.OwnerID, entities = new());
 
                             entities.Add(wall);
-
                             return;
                         }
                     }
@@ -2589,130 +3175,103 @@ namespace Oxide.Plugins
 
                 entities2.Add(entity);
             }
-
-            if (entity is PlayerCorpse || entity.name.Contains("item_drop_backpack"))
-            {
-                NextTick(entity.SafelyKill);
-            }
-            else if (entity is WorldItem)
-            {
-                if (duelsData.Homes.Count > 0)
-                {
-                    NextTick(() => // prevent rpc kick by using NextTick since we're also hooking OnItemDropped
-                    {
-                        if (!entity.IsKilled()) // we must check this or you will still be rpc kicked
-                        {
-                            var worldItem = entity as WorldItem; // allow thrown weapons / destroy items which are dropped by players and on death
-
-                            if (worldItem != null && worldItem.item != null && !IsThrownWeapon(worldItem.item))
-                                entity.Kill();
-                        }
-                    });
-
-                    if (!entity.IsKilled())
-                    {
-                        timer.Repeat(0.1f, 20, () => // track the item to make sure it wasn't thrown out of the dueling zone
-                        {
-                            if (!entity.IsKilled() && !DuelTerritory(entity.transform.position))
-                                entity.Kill(); // destroy items which are dropped from inside to outside of the zone
-                        });
-                    }
-                }
-            }
+            //if (entity is PlayerCorpse corpse && HasEvent(corpse.playerSteamID.ToString())) 
+            //{
+            //    NextTick(entity.SafelyKill);
+            //}
+            //else if (entity.ShortPrefabName.Equals("item_drop_backpack") && entity is DroppedItemContainer c)
+            //{
+            //    SafelyRemoveBackpack(c);
+            //}
         }
 
-        object CanBuild(Planner planner, Construction prefab, Construction.Target target)
+        private object CanBuild(Planner planner, Construction prefab, Construction.Target target)
         {
             var player = planner.GetOwnerPlayer();
-
-            if (player.IsAdmin)
+            if (player == null || player.IsAdmin)
                 return null;
 
-            var position = player.transform.position;
-            var buildPos = position + player.eyes.BodyForward() * 4f; // get the estimated position of where the player is trying to build at
-            var up = buildPos + Vector3.up + new Vector3(0f, 0.6f, 0f);
-
-            buildPos.y = Mathf.Max(position.y, up.y); // adjust the cursor position to our best estimate
-
-            if (DuelTerritory(buildPos, buildingBlockExtensionRadius)) // extend the distance slightly
+            var buildPos = target.entity && target.entity.transform && target.socket ? target.GetWorldPosition() : target.position;
+            if (DuelTerritory(buildPos, buildingBlockExtensionRadius)) // extend the distance by the configured amount
             {
-                if (deployables.Count > 0)
+                if (config.Deployables.Allowed.Count > 0 && prefabs.TryGetValue(prefab.fullName, out var displayName) && config.Deployables.Allowed.TryGetValue(displayName, out var enabled) && enabled && IsParticipant(player.UserIDString))
                 {
-                    var kvp = prefabs.FirstOrDefault(x => x.Key == prefab.fullName);
-
-                    if (!string.IsNullOrEmpty(kvp.Value) && deployables.ContainsKey(kvp.Value) && deployables[kvp.Value])
-                    {
-                        if (dataDuelists.ContainsKey(player.UserIDString) || InMatch(player))
-                        {
-                            return null;
-                        }
-                    }
+                    return null;
                 }
 
-                Message(player, msg("Building is blocked!", player.UserIDString));
+                Message(player, "Building is blocked!");
                 return false;
             }
 
             return null;
         }
 
-        private void OnLootEntity(BasePlayer player, BaseEntity entity) // stop all players from looting anything inside of dueling zones. this allows server owners to setup duels anywhere without worry.
+        private object CanLootEntity(BasePlayer player, BaseEntity entity) // stop all players from looting anything inside of dueling zones. this allows server owners to setup duels anywhere without worry.
         {
-            if (player != null && (IsDueling(player) || InDeathmatch(player) || IsSpectator(player)))
-                timer.Once(0.01f, player.EndLooting);
+            if (player == null || player.IsAdmin)
+                return null;
 
-            if (dataDuelists.Count == 0 && tdmMatches.Count == 0 && spectators.Count == 0)
-                Unsubscribe(nameof(OnLootEntity));
+            if (InEvent(player, true))
+                return true;
+
+            if (!AnyParticipants(true))
+                Unsubscribe(nameof(CanLootEntity));
+
+            return null;
         }
 
-        private object OnCreateWorldProjectile(HitInfo info, Item item) // prevents thrown items from becoming stuck in players when they respawn and requiring them to relog to remove them
+        private object CanCreateWorldProjectile(HitInfo info, ItemDefinition itemDef) // prevents thrown items from becoming stuck in players when they respawn and requiring them to relog to remove them
         {
             if (info == null)
                 return null;
 
-            if (dataDuelists.Count == 0 && tdmMatches.Count == 0)
+            if (!AnyParticipants(true))
             {
-                Unsubscribe(nameof(OnCreateWorldProjectile));
+                Unsubscribe(nameof(CanCreateWorldProjectile));
                 return null;
             }
 
-            var victim = info.HitEntity as BasePlayer;
-            var attacker = info.Initiator as BasePlayer;
+            //if (itemDef.shortname.Contains("arrow") && DuelTerritory(info.HitPositionWorld))
+            //    return true;
 
-            if (victim != null && (IsDueling(victim) || InDeathmatch(victim)))
-                return false; // block it
+            if (DuelTerritory(info.HitPositionWorld))
+                return true;
 
-            if (attacker != null && (IsDueling(attacker) || InDeathmatch(attacker)))
-                return false;
+            //var victim = info.HitEntity as BasePlayer;
+            //if (InEvent(victim))
+            //    return true; // non-bool hook, block it
+
+            //var attacker = info.Initiator as BasePlayer;
+            //if (InEvent(attacker))
+            //    return true;
 
             return null;
         }
 
         private void OnItemDropped(Item item, BaseEntity entity)
         {
-            if (dataDuelists.Count == 0 && tdmMatches.Count == 0) // nothing left to do here, unsubscribe the hook
+            if (!AnyParticipants(true)) // nothing left to do here, unsubscribe the hook
             {
                 Unsubscribe(nameof(OnItemDropped));
                 return;
             }
 
-            if (item.GetOwnerPlayer() == null)
+            var player = item.GetOwnerPlayer();
+            if (player == null)
                 return;
 
-            var player = item.GetOwnerPlayer();
-
-            if (!IsThrownWeapon(item) && (IsDueling(player) || InDeathmatch(player)))
+            if (!IsThrownWeapon(item) && (InEvent(player) || DuelTerritory(entity.transform.position)))
                 item.Remove(0.01f); // do NOT allow players to drop items
         }
 
         private object IsPrisoner(BasePlayer player) // Random Warps
         {
-            return IsDueling(player) || InDeathmatch(player) ? (object)true : null;
+            return DuelTerritory(player.transform.position) ? (object)true : null;
         }
 
         private object CanEventJoin(BasePlayer player) // EventManager
         {
-            return IsDueling(player) || InDeathmatch(player) ? msg("CannotEventJoin", player.UserIDString) : null;
+            return DuelTerritory(player.transform.position) ? msg("CannotEventJoin", player.UserIDString) : null;
         }
 
         private object canRemove(BasePlayer player) // RemoverTool
@@ -2747,7 +3306,7 @@ namespace Oxide.Plugins
 
         private object CanBePenalized(BasePlayer player) // ZLevels Remastered
         {
-            return DuelTerritory(player.transform.position) || dataDuelists.ContainsKey(player.UserIDString) ? (object)false : null;
+            return DuelTerritory(player.transform.position) || IsDuelist(player.UserIDString) ? (object)false : null;
         }
 
         private object canTeleport(BasePlayer player) // 0.1.2: block teleport from NTeleportation plugin
@@ -2765,14 +3324,14 @@ namespace Oxide.Plugins
             return DuelTerritory(player.transform.position) ? (object)false : null;
         }
 
-        private object CanEntityTakeDamage(BaseEntity entity, HitInfo hitinfo) // TruePVE!!!! <3 @ignignokt84
+        private object CanEntityTakeDamage(BasePlayer player, HitInfo info) // TruePVE!!!! <3 @ignignokt84
         {
-            return entity is BasePlayer && DuelTerritory(entity.transform.position) ? (object)true : null;
+            return IsParticipant(player) && DuelTerritory(player.transform.position) && (info == null || DuelTerritory(info.PointStart)) ? (object)true : null;
         }
 
         private object CanJoinAimTrain(BasePlayer player)
         {
-            if (InQueue(player.UserIDString) || InEvent(player) || DuelTerritory(player.transform.position))
+            if (InQueue(player.UserIDString) || IsParticipant(player) || DuelTerritory(player.transform.position))
             {
                 return false;
             }
@@ -2780,37 +3339,25 @@ namespace Oxide.Plugins
             return null;
         }
 
-        private bool InQueue(string userid)
+        private object OnPlayerCommand(BasePlayer player, string command, string[] args)
         {
-            foreach (var element in duelsData.Queued)
-            {
-                if (element.Value == userid)
-                {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        object OnPlayerCommand(BasePlayer player, string command, string[] args)
-        {
-            if (!player.IsValid() || player.transform == null || InQueue(player.UserIDString))
+            if (!player.IsValid() || player.IsDestroyed || InQueue(player.UserIDString))
             {
                 return null;
             }
 
             if (DuelTerritory(player.transform.position))
             {
+                command = command.ToLower();
                 if (useBlacklistCommands && blacklistCommands.Exists(entry => entry.Replace("/", string.Empty).Equals(command, StringComparison.OrdinalIgnoreCase)))
                 {
-                    Message(player, msg("CommandNotAllowed", player.UserIDString));
+                    Message(player, "CommandNotAllowed");
                     return true;
                 }
 
                 if (useWhitelistCommands && !whitelistCommands.Exists(entry => entry.Replace("/", string.Empty).Equals(command, StringComparison.OrdinalIgnoreCase)))
                 {
-                    Message(player, msg("CommandNotAllowed", player.UserIDString));
+                    Message(player, "CommandNotAllowed");
                     return true;
                 }
             }
@@ -2818,28 +3365,28 @@ namespace Oxide.Plugins
             return null;
         }
 
-        object OnServerCommand(ConsoleSystem.Arg arg)
+        private object OnServerCommand(ConsoleSystem.Arg arg)
         {
             var player = arg.Player();
 
-            if (!player.IsValid() || InQueue(player.UserIDString))
+            if (!player.IsValid() || player.IsDestroyed || InQueue(player.UserIDString))
             {
                 return null;
             }
 
             if (DuelTerritory(player.transform.position))
             {
-                string command = arg.cmd.FullName;
+                string command = arg.cmd.FullName.ToLower();
 
                 if (useBlacklistCommands && blacklistCommands.Exists(entry => entry.Replace("/", string.Empty).Equals(command, StringComparison.OrdinalIgnoreCase)))
                 {
-                    Message(player, msg("CommandNotAllowed", player.UserIDString));
+                    Message(player, "CommandNotAllowed");
                     return true;
                 }
 
                 if (useWhitelistCommands && !whitelistCommands.Exists(entry => entry.Replace("/", string.Empty).Equals(command, StringComparison.OrdinalIgnoreCase)))
                 {
-                    Message(player, msg("CommandNotAllowed", player.UserIDString));
+                    Message(player, "CommandNotAllowed");
                     return true;
                 }
             }
@@ -2847,95 +3394,54 @@ namespace Oxide.Plugins
             return null;
         }
 
-        public void CheckAutoReady(BasePlayer player)
+        private void CommandDeathmatch(IPlayer user, string command, string[] args)
         {
-            if (duelsData.AutoReady.Contains(player.UserIDString))
-            {
-                if (!readyUiList.Contains(player.UserIDString))
-                {
-                    ToggleReadyUI(player);
-                }
-            }
-            else if (readyUiList.Contains(player.UserIDString))
-            {
-                CuiHelper.DestroyUi(player, "DuelistUI_Ready");
-                readyUiList.Remove(player.UserIDString);
-            }
-        }
-
-        public void ToggleAutoReady(BasePlayer player)
-        {
-            if (!duelsData.AutoReady.Remove(player.UserIDString))
-                duelsData.AutoReady.Add(player.UserIDString);
-
-            Message(player, msg(duelsData.AutoReady.Contains(player.UserIDString) ? "RematchAutoOn" : "RematchAutoOff", player.UserIDString));
-
-            if (DuelTerritory(player.transform.position))
-                CreateDefeatUI(player);
-
-            if (duelistUI.Contains(player.UserIDString))
-                RefreshUI(player);
-        }
-
-        public void ReadyUp(BasePlayer player)
-        {
-            var rematch = rematches.FirstOrDefault(x => x.HasPlayer(player));
-
-            if (rematch == null)
-            {
-                ToggleAutoReady(player);
-                Message(player, msg("RematchNone", player.UserIDString));
+            BasePlayer player = user.Object as BasePlayer;
+            if (player == null)
                 return;
-            }
 
-            if (rematch.Ready.Contains(player))
-            {
-                Message(player, msg("RematchAcceptedAlready", player.UserIDString));
-                ToggleAutoReady(player);
-            }
-            else
-            {
-                Message(player, msg("RematchAccepted", player.UserIDString));
-                rematch.Ready.Add(player);
-            }
-
-            if (rematch.IsReady())
-            {
-                rematch.Start();
-                rematches.Remove(rematch);
-            }
-        }
-
-        public void cmdTDM(BasePlayer player, string command, string[] args)
-        {
-            if (player.IsAdmin && args.Length == 1 && args[0] == "showall" && tdmMatches.Count > 0)
+            if (player.IsAdmin && args.Contains("showall"))
             {
                 foreach (var match in tdmMatches)
                 {
-                    Message(player, msg("InMatchListGood", player.UserIDString, match.GetNames(Team.Good)));
-                    Message(player, msg("InMatchListEvil", player.UserIDString, match.GetNames(Team.Evil)));
+                    Message(player, "InMatchListGood", match.GetTeamNames(Team.Good));
+                    Message(player, "InMatchListEvil", match.GetTeamNames(Team.Evil));
                 }
 
                 return;
             }
 
-            if (!autoAllowAll && !duelsData.Allowed.Contains(player.UserIDString))
+            if (player.IsAdmin && args.Contains("npc_test"))
             {
-                Message(player, msg("MustAllowDuels", player.UserIDString, szDuelChatCommand));
+                if (!IsNewman(player)) { Message(player, "MustBeNaked"); return; }
+                player.inventory.Strip();
+                FillDeathmatchNpcQueue(player);
+                return;
+            }
+
+            if (args.Contains("remove"))
+            {
+                CommandDuelist(user, command, args);
+                return;
+            }
+
+            if (!DuelsEnabled(player.UserIDString))
+            {
+                Message(player, "MustAllowDuels", szDuelChatCommand);
                 return;
             }
 
             if (IsDueling(player))
             {
-                Message(player, msg("AlreadyInADuel", player.UserIDString));
+                Message(player, "AlreadyInADuel");
                 return;
             }
 
-            var deathmatch = tdmMatches.FirstOrDefault(x => x.GetTeam(player) != Team.None);
+            GetDeathmatch(player, out var deathmatch);
 
             if (deathmatch != null && deathmatch.IsStarted)
             {
-                Message(player, msg("MatchStartedAlready", player.UserIDString));
+                Message(player, "MatchStartedAlready");
                 return;
             }
 
@@ -2944,20 +3450,20 @@ namespace Oxide.Plugins
                 if (deathmatch == null)
                 {
                     if (!autoAllowAll)
-                        Message(player, msg("HelpAllow", player.UserIDString, szDuelChatCommand));
+                        Message(player, "HelpAllow", szDuelChatCommand);
 
-                    Message(player, msg("MatchChallenge0", player.UserIDString, szMatchChatCommand));
-                    Message(player, msg("MatchChallenge2", player.UserIDString, szMatchChatCommand));
-                    Message(player, msg("MatchChallenge3", player.UserIDString, szMatchChatCommand));
-                    Message(player, msg("MatchAccept", player.UserIDString, szMatchChatCommand));
-                    Message(player, msg("MatchCancel", player.UserIDString, szMatchChatCommand));
-                    Message(player, msg("MatchLeave", player.UserIDString, szMatchChatCommand));
-                    Message(player, msg("MatchSize", player.UserIDString, szMatchChatCommand, minDeathmatchSize));
-                    Message(player, msg("MatchKickBan", player.UserIDString, szMatchChatCommand));
-                    Message(player, msg("MatchSetCode", player.UserIDString, szMatchChatCommand));
-                    Message(player, msg("MatchTogglePublic", player.UserIDString, szMatchChatCommand));
-                    Message(player, msg("MatchKit", player.UserIDString, szMatchChatCommand));
-                    Message(player, msg("UI_Help", player.UserIDString, szUIChatCommand));
+                    Message(player, "MatchChallenge0", szMatchChatCommand);
+                    Message(player, "MatchChallenge2", szMatchChatCommand);
+                    Message(player, "MatchChallenge3", szMatchChatCommand);
+                    Message(player, "MatchAccept", szMatchChatCommand);
+                    Message(player, "MatchCancel", szMatchChatCommand);
+                    Message(player, "MatchLeave", szMatchChatCommand);
+                    Message(player, "MatchSize", szMatchChatCommand, minDeathmatchSize);
+                    Message(player, "MatchKickBan", szMatchChatCommand);
+                    Message(player, "MatchSetCode", szMatchChatCommand);
+                    Message(player, "MatchTogglePublic", szMatchChatCommand);
+                    Message(player, "MatchKit", szMatchChatCommand);
+                    Message(player, "UI_Help", szUIChatCommand);
                 }
                 else
                 {
@@ -2966,14 +3472,14 @@ namespace Oxide.Plugins
                     if (!deathmatch.IsHost(player))
                         return;
 
-                    Message(player, msg("MatchCancel", player.UserIDString, szMatchChatCommand));
-                    Message(player, msg("MatchSize", player.UserIDString, szMatchChatCommand, minDeathmatchSize));
-                    Message(player, msg("MatchKickBan", player.UserIDString, szMatchChatCommand));
-                    Message(player, msg("MatchSetCode", player.UserIDString, szMatchChatCommand));
-                    Message(player, msg("MatchTogglePublic", player.UserIDString, szMatchChatCommand));
-                    Message(player, msg("MatchKit", player.UserIDString, szMatchChatCommand));
-                    Message(player, msg("InMatchListGood", player.UserIDString, deathmatch.GetNames(Team.Good)));
-                    Message(player, msg("InMatchListEvil", player.UserIDString, deathmatch.GetNames(Team.Evil)));
+                    Message(player, "MatchCancel", szMatchChatCommand);
+                    Message(player, "MatchSize", szMatchChatCommand, minDeathmatchSize);
+                    Message(player, "MatchKickBan", szMatchChatCommand);
+                    Message(player, "MatchSetCode", szMatchChatCommand);
+                    Message(player, "MatchTogglePublic", szMatchChatCommand);
+                    Message(player, "MatchKit", szMatchChatCommand);
+                    Message(player, "InMatchListGood", deathmatch.GetTeamNames(Team.Good));
+                    Message(player, "InMatchListEvil", deathmatch.GetTeamNames(Team.Evil));
                 }
 
                 return;
@@ -2994,13 +3500,13 @@ namespace Oxide.Plugins
                         ReadyUp(player);
                         return;
                     }
-                case "kit":
+                case "kit": // TDM
                     {
                         if (deathmatch != null)
                         {
                             if (!deathmatch.IsHost(player))
                             {
-                                Message(player, msg("MatchKitSet", player.UserIDString, deathmatch.Kit));
+                                Message(player, "MatchKitSet", deathmatch.Kit);
                                 return;
                             }
 
@@ -3010,22 +3516,18 @@ namespace Oxide.Plugins
 
                                 if (string.IsNullOrEmpty(kit))
                                 {
-                                    Message(player, msg("MatchChallenge0", player.UserIDString, szMatchChatCommand));
-                                    Message(player, msg("KitDoesntExist", player.UserIDString, args[1]));
+                                    Message(player, "MatchChallenge0", szMatchChatCommand);
+                                    Message(player, "KitDoesntExist", args[1]);
 
-                                    string kits = string.Join(", ", VerifiedKits.ToArray());
-
+                                    string kits = string.Join(", ", VerifiedKits);
                                     if (!string.IsNullOrEmpty(kits))
-                                        Message(player, "Kits: " + kits);
+                                        MessageB(player, "Kits: " + kits);
                                 }
-                                else
-                                    deathmatch.Kit = kit;
+                                else deathmatch.Kit = kit;
                             }
-                            else
-                                Message(player, msg("MatchKit", player.UserIDString));
+                            else Message(player, "MatchKit");
                         }
-                        else
-                            Message(player, msg("MatchDoesntExist", player.UserIDString, szMatchChatCommand));
+                        else Message(player, "MatchDoesntExist", szMatchChatCommand);
 
                         return;
                     }
@@ -3035,7 +3537,7 @@ namespace Oxide.Plugins
                         {
                             if (!deathmatch.IsHost(player))
                             {
-                                Message(player, msg("MatchNotAHost", player.UserIDString));
+                                Message(player, "MatchNotAHost");
                                 return;
                             }
 
@@ -3048,21 +3550,16 @@ namespace Oxide.Plugins
                                     if (deathmatch.GetTeam(target) == deathmatch.GetTeam(player))
                                     {
                                         if (deathmatch.Ban(target))
-                                            Message(player, msg("MatchBannedUser", player.UserIDString, target.displayName));
-                                        else
-                                            Message(player, msg("MatchCannotBan", player.UserIDString));
+                                            Message(player, "MatchBannedUser", target.displayName);
+                                        else Message(player, "MatchCannotBan");
                                     }
-                                    else
-                                        Message(player, msg("MatchPlayerNotFound", player.UserIDString, target.displayName));
+                                    else Message(player, "MatchPlayerNotFound", target.displayName);
                                 }
-                                else
-                                    Message(player, msg("PlayerNotFound", player.UserIDString, args[1]));
+                                else Message(player, "PlayerNotFound", args[1]);
                             }
-                            else
-                                Message(player, msg("MatchKickBan", player.UserIDString));
+                            else Message(player, "MatchKickBan");
                         }
-                        else
-                            Message(player, msg("MatchDoesntExist", player.UserIDString, szMatchChatCommand));
+                        else Message(player, "MatchDoesntExist", szMatchChatCommand);
 
                         break;
                     }
@@ -3070,18 +3567,16 @@ namespace Oxide.Plugins
                     {
                         if (deathmatch != null)
                         {
-                            if (deathmatch.IsHost(player))
+                            if (deathmatch.IsHost(player, out var host))
                             {
                                 if (args.Length == 2)
-                                    deathmatch.SetCode(player, args[1]);
+                                    deathmatch.SetCode(host, args[1]);
 
-                                Message(player, msg("MatchCodeIs", player.UserIDString, deathmatch.GetTeam(player) == Team.Evil ? deathmatch.Code(Team.Evil) : deathmatch.Code(Team.Good)));
+                                Message(player, "MatchCodeIs", host.Code);
                             }
-                            else
-                                Message(player, msg("MatchNotAHost", player.UserIDString));
+                            else Message(player, "MatchNotAHost");
                         }
-                        else
-                            Message(player, msg("MatchDoesntExist", player.UserIDString, szMatchChatCommand));
+                        else Message(player, "MatchDoesntExist", szMatchChatCommand);
 
                         break;
                     }
@@ -3095,43 +3590,36 @@ namespace Oxide.Plugins
                                 deathmatch.MessageAll("MatchCancelled", player.displayName);
                                 deathmatch.End();
 
-                                if (tdmMatches.Contains(deathmatch))
+                                if (tdmMatches.Remove(deathmatch))
                                 {
-                                    tdmMatches.Remove(deathmatch);
                                     matchUpdateRequired = true;
                                 }
                             }
-                            else
-                                Message(player, msg("MatchNotAHost", player.UserIDString));
+                            else Message(player, "MatchNotAHost");
                         }
                         else // also handle cancelling a match request
                         {
-                            if (tdmRequests.ContainsValue(player.UserIDString))
+                            if (GetMatchRequestSender(player, out var requesterId) && tdmRequests.Remove(requesterId))
                             {
-                                var entry = tdmRequests.FirstOrDefault(kvp => kvp.Value == player.UserIDString);
-                                var target = BasePlayer.Find(entry.Key);
+                                var requester = BasePlayer.Find(requesterId);
+                                if (requester != null)
+                                    Message(requester, "MatchCancelled", player.displayName);
 
-                                if (target != null)
-                                    Message(target, msg("MatchCancelled", target.UserIDString, player.displayName));
-
-                                Message(player, msg("MatchCancelled", player.UserIDString, player.displayName));
-                                tdmRequests.Remove(entry.Key);
+                                Message(player, "MatchCancelled", player.displayName);
                                 return;
                             }
 
-                            if (tdmRequests.ContainsKey(player.UserIDString))
+                            if (GetMatchRequestTarget(player, out var targetId) && tdmRequests.Remove(player.UserIDString))
                             {
-                                var target = BasePlayer.Find(tdmRequests[player.UserIDString]);
-
+                                var target = BasePlayer.Find(targetId);
                                 if (target != null)
-                                    Message(target, msg("MatchCancelled", player.UserIDString, player.displayName));
+                                    Message(target, "MatchCancelled", player.displayName);
 
-                                Message(player, msg("MatchCancelled", player.UserIDString, player.displayName));
-                                tdmRequests.Remove(player.UserIDString);
+                                Message(player, "MatchCancelled", player.displayName);
                                 return;
                             }
 
-                            Message(player, msg("MatchDoesntExist", player.UserIDString, szMatchChatCommand));
+                            Message(player, "MatchDoesntExist", szMatchChatCommand);
                         }
 
                         break;
@@ -3142,12 +3630,10 @@ namespace Oxide.Plugins
                         {
                             if (args.Length == 2)
                             {
-                                if (args[1].All(char.IsDigit))
+                                if (int.TryParse(args[1], out int size))
                                 {
                                     if (deathmatch.IsHost(player))
                                     {
-                                        int size = Convert.ToInt32(args[1]);
-
                                         if (size < minDeathmatchSize)
                                             size = deathmatch.TeamSize;
 
@@ -3157,42 +3643,37 @@ namespace Oxide.Plugins
                                         if (deathmatch.TeamSize != size)
                                             deathmatch.TeamSize = size; // sends message to all players in the match
                                     }
-                                    else
-                                        Message(player, msg("MatchNotAHost", player.UserIDString));
+                                    else Message(player, "MatchNotAHost");
                                 }
-                                else
-                                    Message(player, msg("InvalidNumber", player.UserIDString, args[1]));
+                                else Message(player, "InvalidNumber", args[1]);
                             }
-                            else
-                                Message(player, msg("MatchSizeSyntax", player.UserIDString, szMatchChatCommand));
+                            else Message(player, "MatchSizeSyntax", szMatchChatCommand);
                         }
-                        else
-                            Message(player, msg("MatchDoesntExist", player.UserIDString, szMatchChatCommand));
+                        else Message(player, "MatchDoesntExist", szMatchChatCommand);
 
                         break;
                     }
                 case "accept":
                     {
-                        if (InEvent(player))
+                        if (IsParticipant(player))
                         {
-                            Message(player, msg("AlreadyDueling", player.UserIDString));
+                            Message(player, "AlreadyDueling");
                             return;
                         }
 
-                        if (!tdmRequests.ContainsValue(player.UserIDString))
+                        if (!GetMatchRequestSender(player, out var requesterId))
                         {
-                            Message(player, msg("MatchNoneRequested", player.UserIDString));
+                            Message(player, "MatchNoneRequested");
                             return;
                         }
 
-                        var kvp = tdmRequests.FirstOrDefault(entry => entry.Value == player.UserIDString);
-                        var target = BasePlayer.Find(kvp.Key);
+                        tdmRequests.Remove(requesterId);
 
-                        tdmRequests.Remove(kvp.Key);
+                        var target = BasePlayer.Find(requesterId);
 
                         if (IsNotConnected(target))
                         {
-                            Message(player, msg("MatchPlayerOffline", player.UserIDString));
+                            Message(player, "MatchPlayerOffline");
                             break;
                         }
 
@@ -3201,13 +3682,7 @@ namespace Oxide.Plugins
                     }
                 case "leave":
                     {
-                        if (deathmatch != null)
-                        {
-                            deathmatch.RemoveMatchPlayer(player);
-                            Message(player, msg("MatchPlayerLeft", player.UserIDString));
-                        }
-                        else
-                            Message(player, msg("MatchDoesntExist", player.UserIDString, szMatchChatCommand));
+                        LeaveEvent(player);
 
                         break;
                     }
@@ -3215,14 +3690,14 @@ namespace Oxide.Plugins
                     {
                         if (tdmMatches.Count == 0)
                         {
-                            Message(player, msg("MatchNoMatchesExist", player.UserIDString, szMatchChatCommand));
+                            Message(player, "MatchNoMatchesExist", szMatchChatCommand);
                             return;
                         }
 
                         if (deathmatch != null)
                         {
                             deathmatch.RemoveMatchPlayer(player);
-                            Message(player, msg("MatchPlayerLeft", player.UserIDString));
+                            Message(player, "MatchPlayerLeft");
                         }
 
                         foreach (var match in tdmMatches)
@@ -3230,13 +3705,13 @@ namespace Oxide.Plugins
                             if (match.IsBanned(player.userID) || match.IsFull())
                                 continue;
 
-                            if (!match.IsFull(Team.Good) && match.AlliedTo(player, Team.Good))
+                            if (!match.IsFull(Team.Good) && match.IsAlliedTo(player, Team.Good))
                             {
                                 match.AddMatchPlayer(player, Team.Good);
                                 return;
                             }
 
-                            if (!match.IsFull(Team.Evil) && match.AlliedTo(player, Team.Evil))
+                            if (!match.IsFull(Team.Evil) && match.IsAlliedTo(player, Team.Evil))
                             {
                                 match.AddMatchPlayer(player, Team.Evil);
                                 return;
@@ -3258,7 +3733,7 @@ namespace Oxide.Plugins
                             }
                         }
 
-                        Message(player, msg("MatchNoTeamFoundAny", player.UserIDString, args[0]));
+                        Message(player, "MatchNoTeamFoundAny", args[0]);
                         break;
                     }
                 case "public":
@@ -3267,14 +3742,13 @@ namespace Oxide.Plugins
                         {
                             if (!deathmatch.IsHost(player))
                             {
-                                Message(player, msg("MatchNotAHost", player.UserIDString));
+                                Message(player, "MatchNotAHost");
                                 return;
                             }
 
                             deathmatch.IsPublic = !deathmatch.IsPublic;
                         }
-                        else
-                            Message(player, msg("MatchDoesntExist", player.UserIDString, szMatchChatCommand));
+                        else Message(player, "MatchDoesntExist", szMatchChatCommand);
 
                         break;
                     }
@@ -3286,7 +3760,7 @@ namespace Oxide.Plugins
 
                             foreach (string arg in args)
                             {
-                                string kit = GetVerifiedKit(arg);
+                                string kit = GetVerifiedKit(arg); // TDM
 
                                 if (!string.IsNullOrEmpty(kit))
                                 {
@@ -3302,54 +3776,53 @@ namespace Oxide.Plugins
                         {
                             if (target == player)
                             {
-                                Message(player, msg("PlayerNotFound", player.UserIDString, args[0]));
+                                Message(player, "PlayerNotFound", args[0]);
                                 return;
                             }
 
                             if (deathmatch != null)
                             {
-                                Message(player, msg("MatchCannotChallengeAgain", player.UserIDString));
+                                Message(player, "MatchCannotChallengeAgain");
                                 return;
                             }
 
-                            if (InMatch(target) || tdmRequests.ContainsValue(target.UserIDString))
+                            if (IsTeamMember(target) || HasRequestSender(target))
                             {
-                                Message(player, msg("MatchCannotChallenge", player.UserIDString, target.displayName));
+                                Message(player, "MatchCannotChallenge", target.displayName);
                                 return;
                             }
 
                             if (!IsNewman(player))
                             {
-                                Message(player, msg("MustBeNaked", player.UserIDString));
+                                Message(player, "MustBeNaked");
                                 return;
                             }
 
                             if (!IsNewman(target))
                             {
-                                Message(player, msg("TargetMustBeNaked", player.UserIDString));
+                                Message(player, "TargetMustBeNaked");
                                 return;
                             }
 
-                            Message(player, msg("MatchRequestSent", player.UserIDString, target.displayName));
-                            Message(target, msg("MatchRequested", target.UserIDString, player.displayName, szMatchChatCommand));
+                            Message(player, "MatchRequestSent", target.displayName);
+                            Message(target, "MatchRequested", player.displayName, szMatchChatCommand);
 
                             string uid = player.UserIDString;
-                            tdmRequests.Remove(uid);
-                            tdmRequests.Add(uid, target.UserIDString);
+                            tdmRequests[uid] = target.UserIDString;
                             timer.Once(60f, () => tdmRequests.Remove(uid));
                             return;
                         }
 
                         if (tdmMatches.Count == 0)
                         {
-                            Message(player, msg("MatchNoMatchesExist", player.UserIDString, szMatchChatCommand));
+                            Message(player, "MatchNoMatchesExist", szMatchChatCommand);
                             return;
                         }
 
                         if (deathmatch != null)
                         {
                             deathmatch.RemoveMatchPlayer(player);
-                            Message(player, msg("MatchPlayerLeft", player.UserIDString));
+                            Message(player, "MatchPlayerLeft");
                         }
 
                         foreach (var match in tdmMatches)
@@ -3357,51 +3830,62 @@ namespace Oxide.Plugins
                             if (match.IsBanned(player.userID))
                                 continue;
 
-                            if (match.Code(Team.Good).Equals(args[0], StringComparison.OrdinalIgnoreCase))
+                            if (match.GetCode(Team.Good).Equals(args[0], StringComparison.OrdinalIgnoreCase))
                             {
                                 match.AddMatchPlayer(player, Team.Good);
                                 return;
                             }
-                            else if (match.Code(Team.Evil).Equals(args[0], StringComparison.OrdinalIgnoreCase))
+                            else if (match.GetCode(Team.Evil).Equals(args[0], StringComparison.OrdinalIgnoreCase))
                             {
                                 match.AddMatchPlayer(player, Team.Evil);
                                 return;
                             }
                         }
 
-                        Message(player, msg("MatchNoTeamFoundCode", player.UserIDString, args[0]));
+                        Message(player, "MatchNoTeamFoundCode", args[0]);
 
                     }
                     break;
             }
         }
 
-        public void cmdQueue(BasePlayer player, string command, string[] args)
+        private void CommandQueue(IPlayer user, string command, string[] args)
         {
+            BasePlayer player = user.Object as BasePlayer;
             if (IsNotConnected(player) || AimTrain.CanCall() && Convert.ToBoolean(AimTrain?.Call("IsAimTraining", (ulong)player.userID)))
+            {
                 return;
+            }
+
+            if (args.Contains("list"))
+            {
+                Message(player, "InQueueList");
+                MessageB(player, string.Join(", ", Queued.Select(kvp => kvp.Value.Name)));
+                return;
+            }
 
             if (!player.CanInteract())
             {
-                timer.Once(1f, () => cmdQueue(player, command, args));
+                //Message(player, "HelpQueueInteract");
+                //timer.Once(1f, () => CommandQueue(user, command, args));
                 return;
             }
 
-            if (!autoAllowAll && !duelsData.Allowed.Contains(player.UserIDString))
+            if (!DuelsEnabled(player.UserIDString))
             {
-                Message(player, msg("MustAllowDuels", player.UserIDString, szDuelChatCommand));
+                Message(player, "MustAllowDuels", szDuelChatCommand);
                 return;
             }
 
-            if (InMatch(player))
+            if (IsTeamMember(player))
             {
-                Message(player, msg("MatchTeamed", player.UserIDString));
+                Message(player, "MatchTeamed");
                 return;
             }
 
             if (IsDueling(player))
             {
-                Message(player, msg("AlreadyInADuel", player.UserIDString));
+                Message(player, "AlreadyInADuel");
                 return;
             }
 
@@ -3409,280 +3893,154 @@ namespace Oxide.Plugins
 
             if (!IsNewman(player))
             {
-                Message(player, msg("MustBeNaked", player.UserIDString));
+                Message(player, "MustBeNaked");
                 return;
-            }
-
-            if (player.IsAdmin)
-            {
-                Message(player, msg("InQueueList", player.UserIDString));
-                Message(player, string.Join(", ", duelsData.Queued.Select(kvp => GetDisplayName(kvp.Value))));
             }
 
             if (!InQueue(player.UserIDString))
             {
-                long stamp = TimeStamp();
-
-                while (duelsData.Queued.ContainsKey(stamp))
-                    stamp++;
-
-                duelsData.Queued.Add(stamp, player.UserIDString);
-                Message(player, msg("InQueueSuccess", player.UserIDString));
+                Queued.Add(DateTime.Now.Ticks, new(player));
+                Message(player, "InQueueSuccess");
                 CheckQueue();
                 return;
             }
 
             if (RemoveFromQueue(player.UserIDString))
-                Message(player, msg("NoLongerQueued", player.UserIDString));
+                Message(player, "NoLongerQueued");
         }
 
-        private void cmdLadder(BasePlayer player, string command, string[] args)
+        private void CommandLadder(BasePlayer player, string command, string[] args)
         {
-            bool onLadder = false;
-            bool life = args.Exists(arg => arg.Contains("life", StringComparison.OrdinalIgnoreCase));
-            using var sorted = GetPool(life ? duelsData.Victories : duelsData.VictoriesSeed);
-            sorted.Sort((x, y) => y.Value.CompareTo(x.Value));
-
-            Message(player, msg(life ? "TopAll" : "Top", player.UserIDString, sorted.Count));
-
-            for (int i = 0; i < 10; i++)
-            {
-                if (i >= sorted.Count)
-                    break;
-
-                var sort = sorted[i];
-                if (sort.Key == player.UserIDString)
-                    onLadder = true; // 0.1.2: fix for ranks showing user on ladder twice
-
-                string name = GetDisplayName(sort.Key);
-                int losses = 0;
-
-                if (life) losses = duelsData.Losses.TryGetValue(sort.Key, out var v1) ? v1 : 0;
-                else losses = duelsData.LossesSeed.TryGetValue(sort.Key, out var v1) ? v1 : 0;
-
-                double ratio = losses > 0 ? Math.Round(sort.Value / (double)losses, 2) : sort.Value;
-                string message = msg("TopFormat", player.UserIDString, (i + 1).ToString(), name, sort.Value, losses, ratio);
-                Player.Message(player, message, Convert.ToUInt64(sort.Key));
-            }
-
-            if (!onLadder && !life && duelsData.VictoriesSeed.TryGetValue(player.UserIDString, out var v2))
-            {
-                int index = sorted.FindIndex(kvp => kvp.Key == player.UserIDString);
-                int losses = duelsData.LossesSeed.TryGetValue(player.UserIDString, out var v2s) ? v2s : 0;
-                double ratio = losses > 0 ? Math.Round(v2 / (double)losses, 2) : v2;
-                string message = msg("TopFormat", player.UserIDString, index, player.displayName, v2, losses, ratio);
-                Player.Message(player, message, player.userID);
-            }
-
-            if (!onLadder && life && duelsData.Victories.TryGetValue(player.UserIDString, out var v3))
-            {
-                int index = sorted.FindIndex(kvp => kvp.Key == player.UserIDString);
-                int losses = duelsData.Losses.TryGetValue(player.UserIDString, out var v3s) ? v3s : 0;
-                double ratio = losses > 0 ? Math.Round(v3 / (double)losses, 2) : v3;
-                string message = msg("TopFormat", player.UserIDString, index, player.displayName, v3, losses, ratio);
-                Player.Message(player, message, player.userID);
-            }
-
-            if (!life) Message(player, msg("LadderLife", player.UserIDString, szDuelChatCommand));
-        }
-
-        private void ccmdDuel(ConsoleSystem.Arg arg)
-        {
-            if (!arg.IsAdmin)
+            if (player == null) 
                 return;
 
-            string id = arg.Player()?.UserIDString ?? null;
+            bool life = Array.Exists(args, a => a.Contains("life", StringComparison.OrdinalIgnoreCase));
+            using var ladder = GetPooledList<KeyValuePair<ulong, int>>();
+            foreach (var (n, wins) in data.Get(life ? Points.Victory : Points.VictorySeed)) // build & sort
+                if (ulong.TryParse(n, out var id))
+                    ladder.Add(new(id, wins));
 
-            if (arg.HasArgs(1))
+            if (ladder.Count < 30 && ConVar.Server.hostname.EndsWith("ed Test"))
             {
-                switch (arg.Args[0].ToLower())
+                for (int i = 0; i < 30 - ladder.Count; i++)
                 {
-                    case "resetseed":
-                        {
-                            duelsData.VictoriesSeed.Clear();
-                            duelsData.LossesSeed.Clear();
-                            duelsData.MatchKillsSeed.Clear();
-                            duelsData.MatchDeathsSeed.Clear();
-                            duelsData.MatchLossesSeed.Clear();
-                            duelsData.MatchVictoriesSeed.Clear();
-                            duelsData.MatchSizesVictoriesSeed.Clear();
-                            duelsData.MatchSizesVictoriesSeed.Clear();
-                            arg.ReplyWith(msg("ResetSeed", arg.Player()?.UserIDString));
-                            break;
-                        }
-                    case "removeall":
-                        {
-                            if (duelingZones.Count > 0)
-                            {
-                                using var zones = GetPool(duelingZones);
-                                foreach (var zone in zones)
-                                {
-                                    EjectPlayers(zone);
-                                    arg.ReplyWith(msg("RemovedZoneAt", id, zone.Position));
-                                    RemoveDuelZone(zone);
-                                }
-
-                                duelsData.Zones.Clear();
-                                SaveData();
-                            }
-                            else
-                                arg.ReplyWith(msg("NoZoneExists", id));
-
-                            break;
-                        }
-                    case "1":
-                    case "enable":
-                    case "on":
-                        {
-                            if (duelsData.DuelsEnabled)
-                            {
-                                arg.ReplyWith(msg("DuelsEnabledAlready", id));
-                                return;
-                            }
-
-                            duelsData.DuelsEnabled = true;
-                            arg.ReplyWith(msg("DuelsNowEnabled", id));
-                            DuelAnnouncement(false);
-                            SaveData();
-                            return;
-                        }
-                    case "0":
-                    case "disable":
-                    case "off":
-                        {
-                            if (!duelsData.DuelsEnabled)
-                            {
-                                arg.ReplyWith(msg("DuelsDisabledAlready", id));
-                                return;
-                            }
-
-                            duelsData.DuelsEnabled = false;
-                            arg.ReplyWith(msg(dataDuelists.Count > 0 ? "DuelsNowDisabled" : "DuelsNowDisabledEmpty", id));
-                            SendDuelistsHome();
-                            SendSpectatorsHome();
-                            SaveData();
-                            return;
-                        }
-                    case "new":
-                        {
-                            if (duelsData.Zones.Count >= zoneAmount)
-                            {
-                                arg.ReplyWith(msg("ZoneLimit", id, zoneAmount));
-                                return;
-                            }
-
-                            var name = arg.GetString(1, null);
-                            var radius = arg.GetFloat(2, zoneRadius);
-                            var zone = GetZoneName(name, radius);
-
-                            if (SetupDuelZone(null, zone) != Vector3.zero)
-                                arg.ReplyWith(msg("ZoneCreated", id));
-
-                            return;
-                        }
-                    default:
-                        {
-                            arg.ReplyWith(string.Format("{0} on|off|new|removeall|resetseed", szDuelChatCommand));
-                            break;
-                        }
+                    var userid = (ulong)UnityEngine.Random.Range(1000, 9999999);
+                    ladder.Add(new(userid, UnityEngine.Random.Range(15, 60)));
                 }
+
+                ladder.Insert(15, new(player.userID, 15));
             }
-            else
-                arg.ReplyWith(string.Format("{0} on|off|new|removeall|resetseed", szDuelChatCommand));
+
+            ladder.Sort((a, b) => b.Value.CompareTo(a.Value)); // high-to-low
+
+            Message(player, life ? "TopAll" : "Top", ladder.Count);
+            int me = ladder.FindIndex(e => e.Key == player.userID); // -1 ⇒ never played
+
+            for (int i = 0; i < ladder.Count; i++) // print top-10, plus the player's own row if it's outside the top-10
+            {
+                if (i >= 10 && i != me) continue;
+                PrintRank(i + 1, ladder[i].Key, ladder[i].Value);
+            }
+
+            if (!life)
+                Message(player, "LadderLife", szDuelChatCommand);
+
+            void PrintRank(int rank, ulong id, int value)
+            {
+                string name = id == player.userID ? player.displayName : ConVar.Admin.GetPlayerName(id);
+                int losses = data.Get(id.ToString(), life ? Points.Loss : Points.LossSeed);
+                double ratio = losses > 0 ? Math.Round(value / (double)losses, 2) : value;
+                Player.Message(player, msg("TopFormat", player.UserIDString, rank.ToString(), name, value, losses, ratio), id);
+            }
         }
 
-        private void CommandDuelist(IPlayer player, string command, string[] args)
+        private void CommandDuelist(IPlayer user, string command, string[] args)
         {
-            switch (args[0])
-            {
-                case "kit":
-                    {
-                        string kits = string.Join(", ", VerifiedKits.ToArray());
-
-                        player.Reply(string.IsNullOrEmpty(kits) ? msg("KitsNotConfigured", player.Id) : "Kits: " + kits);
-                        return;
-                    }
-            }
-        }
-
-        private void cmdDuel(BasePlayer player, string command, string[] args)
-        {
-            if (AimTrain.CanCall() && Convert.ToBoolean(AimTrain?.Call("IsAimTraining", (ulong)player.userID)))
+            var player = user.Object as BasePlayer;
+            if (player != null && AimTrain.CanCall() && Convert.ToBoolean(AimTrain?.Call("IsAimTraining", (ulong)player.userID)))
                 return;
 
-            if (IsEventBanned(player.UserIDString))
+            bool isAllowed = player != null && player.IsAdmin;
+            if (IsEventBanned(user.Id))
             {
-                Message(player, msg("Banned", player.UserIDString));
+                Message(user, "Banned");
                 return;
             }
 
-            if (dcsBlock.Contains(player.UserIDString))
+            if (IsBlocked(user.Id))
             {
-                Message(player, msg("SuicideBlock", player.UserIDString));
+                Message(user, "SuicideBlock");
+                return;
+            }
+
+            if (args.Contains("death_test"))
+            {
+                user.Message(msg("MatchDeathMessage1", user.Id, "nivex", "zada", ":rifle.ak:", "Head", 33.55));
+                user.Message(msg("MatchDeathMessage2", user.Id, user.Name, data.Get(user.Id, Points.MatchSizeVictorySeed, 3), data.Get(user.Id, Points.MatchSizeLossSeed, 3), "zada", data.Get("1", Points.MatchSizeVictory, 3), data.Get("1", Points.MatchSizeVictory, 3), 3, GetWeapon(ItemManager.FindItemDefinition("rifle.ak"), "AK"), 35.33));
+                user.Message(msg("DuelDeathMessage", user.Id, user.Name, 5, 1, "zada", 1, 5, 75.33, string.Empty));
                 return;
             }
 
             if (args.Length >= 1 && args[0] == "ladder")
             {
-                cmdLadder(player, command, args);
+                CommandLadder(player, command, args);
                 return;
             }
-
-            if (!duelsData.DuelsEnabled)
+            
+            if (!data.DuelsEnabled)
             {
-                if (!args.Exists(arg => arg.ToLower() == "on"))
-                    Message(player, msg("DuelsDisabled", player.UserIDString));
+                if (!Array.Exists(args, arg => arg.ToLower() == "on"))
+                    Message(user, "DuelsDisabled");
 
-                if (!player.IsAdmin)
+                if (!user.IsAdmin)
                     return;
             }
 
-            bool noZone = duelsData.Zones.Count == 0 || duelingZones.Count == 0;
+            bool noZone = data.Zones.Count == 0 || duelingZones.Count == 0;
 
             if (noZone)
             {
-                if (!args.Exists(arg => arg.ToLower() == "new") && !args.Exists(arg => arg.ToLower() == "removeall") && !args.Exists(arg => arg.ToLower() == "custom"))
-                    Message(player, msg("NoZoneExists", player.UserIDString));
+                if (!Array.Exists(args, arg => arg.ToLower() == "new") && !Array.Exists(args, arg => arg.ToLower() == "removeall") && !Array.Exists(args, arg => arg.ToLower() == "custom"))
+                    Message(user, "NoZoneExists");
 
-                if (!player.IsAdmin)
+                if (!user.IsAdmin)
                     return;
             }
 
-            if (!noZone && !duelsData.DuelsEnabled && !args.Exists(arg => arg.ToLower() == "on"))
-                Message(player, msg("DuelsMustBeEnabled", player.UserIDString, szDuelChatCommand));
+            if (!noZone && !data.DuelsEnabled && !Array.Exists(args, arg => arg.ToLower() == "on"))
+                Message(user, "DuelsMustBeEnabled", szDuelChatCommand);
 
-            if (IsDueling(player) && !player.IsAdmin)
-                return;
+            bool isLimited = !user.IsAdmin && IsDueling(player);
 
             if (args.Length == 0)
             {
-                Message(player, msg("HelpDuels", player.UserIDString, duelsData.TotalDuels.ToString("N0")));
-                Message(player, msg("ZoneNames", player.UserIDString, duelsData.Zones.Count, string.Join(" ", duelsData.Zones.Values.Take(10).Select(x => x.name))));
+                Message(user, "HelpDuels", data.TotalDuels.ToString("N0"));
+                Message(user, "ZoneNames", data.Zones.Count, string.Join(" ", data.Zones.Values.Take(10).Select(x => x.name)));
 
                 if (!autoAllowAll)
-                    Message(player, msg("HelpAllow", player.UserIDString, szDuelChatCommand));
+                    Message(user, "HelpAllow", szDuelChatCommand);
 
-                Message(player, msg("HelpBlock", player.UserIDString, szDuelChatCommand));
-                Message(player, msg("HelpChallenge", player.UserIDString, szDuelChatCommand));
-                Message(player, msg("HelpAccept", player.UserIDString, szDuelChatCommand));
-                Message(player, msg("HelpCancel", player.UserIDString, szDuelChatCommand));
-                Message(player, msg("HelpChat", player.UserIDString, szDuelChatCommand));
-                Message(player, msg("HelpQueue", player.UserIDString, szQueueChatCommand));
-                Message(player, msg("HelpLadder", player.UserIDString, szDuelChatCommand));
-                Message(player, msg("HelpKit", player.UserIDString, szDuelChatCommand));
+                Message(user, "HelpBlock", szDuelChatCommand);
+                Message(user, "HelpChallenge", szDuelChatCommand);
+                Message(user, "HelpAccept", szDuelChatCommand);
+                Message(user, "HelpCancel", szDuelChatCommand);
+                Message(user, "HelpChat", szDuelChatCommand);
+                Message(user, "HelpQueue", szQueueChatCommand);
+                Message(user, "HelpLadder", szDuelChatCommand);
+                Message(user, "HelpKit", szDuelChatCommand);
 
                 if (allowBets)
-                    Message(player, msg("HelpBet", player.UserIDString, szDuelChatCommand));
+                    Message(user, "HelpBet", szDuelChatCommand);
 
                 if (tdmEnabled)
-                    Message(player, msg("HelpTDM", player.UserIDString, szMatchChatCommand));
+                    Message(user, "HelpTDM", szMatchChatCommand);
 
-                Message(player, msg("UI_Help", player.UserIDString, szUIChatCommand));
+                Message(user, "UI_Help", szUIChatCommand);
 
-                if (player.IsAdmin)
+                if (user.IsAdmin)
                 {
-                    Message(player, msg("HelpDuelAdmin", player.UserIDString, szDuelChatCommand));
-                    Message(player, msg("HelpDuelAdminRefundAll", player.UserIDString, szDuelChatCommand));
+                    Message(user, "HelpDuelAdmin", szDuelChatCommand);
+                    Message(user, "HelpDuelAdminRefundAll", szDuelChatCommand);
                 }
 
                 return;
@@ -3690,11 +4048,16 @@ namespace Oxide.Plugins
 
             switch (args[0].ToLower())
             {
+                case "leave":
+                    {
+                        LeaveEvent(player);
+                        return;
+                    }
                 case "grid":
                     {
-                        if (player.IsAdmin)
+                        if (isAllowed)
                         {
-                            if (_gridPositions.Count < 5000) SetupPositions();
+                            if (_gridPositions.Count < 5000) _gridPositions.UnionWith(_gridPositionsVal);
                             foreach (var pos in _gridPositions)
                             {
                                 if (player.Distance(pos) > 1000f) continue;
@@ -3717,77 +4080,11 @@ namespace Oxide.Plugins
                     }
                 case "resetseed":
                     {
-                        if (player.IsAdmin)
+                        if (user.IsAdmin)
                         {
-                            duelsData.VictoriesSeed.Clear();
-                            duelsData.LossesSeed.Clear();
-                            duelsData.MatchKillsSeed.Clear();
-                            duelsData.MatchDeathsSeed.Clear();
-                            duelsData.MatchLossesSeed.Clear();
-                            duelsData.MatchVictoriesSeed.Clear();
-                            duelsData.MatchSizesVictoriesSeed.Clear();
-                            duelsData.MatchSizesVictoriesSeed.Clear();
-                            Message(player, msg("ResetSeed", player.UserIDString));
-                            Puts("{0] ({1}): {2}", player.displayName, player.UserIDString, msg("ResetSeed", player.UserIDString));
-                        }
-                        break;
-                    }
-                case "remove_all_walls":
-                    {
-                        if (player.IsAdmin)
-                        {
-                            int removed = 0;
-
-                            if (respawnWalls)
-                            {
-                                Unsubscribe(nameof(OnEntityKill));
-                            }
-
-                            foreach (var entity in GetWallEntities())
-                            {
-                                if (entity.OwnerID > 0 && !entity.OwnerID.IsSteamId())
-                                {
-                                    entity.Kill();
-                                    removed++;
-                                }
-                            }
-
-                            if (respawnWalls)
-                            {
-                                Subscribe(nameof(OnEntityKill));
-                            }
-
-                            Message(player, msg("RemovedXWalls", player.UserIDString, removed));
-                        }
-                        break;
-                    }
-                case "remove_all":
-                    {
-                        if (player.IsAdmin && args.Length == 2 && args[1].All(char.IsDigit))
-                        {
-                            ulong ownerId = ulong.Parse(args[1]);
-                            int removed = 0;
-
-                            if (respawnWalls)
-                            {
-                                Unsubscribe(nameof(OnEntityKill));
-                            }
-
-                            foreach (var entity in GetWallEntities())
-                            {
-                                if (entity.OwnerID == ownerId)
-                                {
-                                    entity.Kill();
-                                    removed++;
-                                }
-                            }
-
-                            if (respawnWalls)
-                            {
-                                Subscribe(nameof(OnEntityKill));
-                            }
-
-                            Message(player, msg("RemovedXWalls", player.UserIDString, removed));
+                            data.ResetSeed();
+                            Message(user, "ResetSeed");
+                            if (!user.IsServer) Puts("{0] ({1}): {2}", user.Name, user.Id, msg("ResetSeed", user.Id));
                         }
                         break;
                     }
@@ -3795,16 +4092,16 @@ namespace Oxide.Plugins
                 case "disable":
                 case "off":
                     {
-                        if (player.IsAdmin)
+                        if (user.IsAdmin)
                         {
-                            if (!duelsData.DuelsEnabled)
+                            if (!data.DuelsEnabled)
                             {
-                                Message(player, msg("DuelsDisabledAlready", player.UserIDString));
+                                Message(user, "DuelsDisabledAlready");
                                 return;
                             }
 
-                            duelsData.DuelsEnabled = false;
-                            Message(player, msg(dataDuelists.Count > 0 ? "DuelsNowDisabled" : "DuelsNowDisabledEmpty", player.UserIDString));
+                            data.DuelsEnabled = false;
+                            Message(user, _duelists.Count > 0 ? "DuelsNowDisabled" : "DuelsNowDisabledEmpty");
                             SendDuelistsHome();
                             SendSpectatorsHome();
                             SaveData();
@@ -3815,16 +4112,16 @@ namespace Oxide.Plugins
                 case "enable":
                 case "on":
                     {
-                        if (player.IsAdmin)
+                        if (user.IsAdmin)
                         {
-                            if (duelsData.DuelsEnabled)
+                            if (data.DuelsEnabled)
                             {
-                                Message(player, msg("DuelsEnabledAlready", player.UserIDString));
+                                Message(user, "DuelsEnabledAlready");
                                 return;
                             }
 
-                            duelsData.DuelsEnabled = true;
-                            Message(player, msg("DuelsNowEnabled", player.UserIDString));
+                            data.DuelsEnabled = true;
+                            Message(user, "DuelsNowEnabled");
                             DuelAnnouncement(false);
                             SaveData();
                         }
@@ -3833,11 +4130,11 @@ namespace Oxide.Plugins
                 case "custom":
                 case "me":
                     {
-                        if (player.IsAdmin)
+                        if (isAllowed)
                         {
-                            if (duelsData.Zones.Count >= zoneAmount)
+                            if (data.Zones.Count >= zoneAmount)
                             {
-                                Message(player, msg("ZoneLimit", player.UserIDString, zoneAmount));
+                                Message(user, "ZoneLimit", zoneAmount);
                                 return;
                             }
 
@@ -3845,7 +4142,7 @@ namespace Oxide.Plugins
                             {
                                 if (DuelTerritory(hit.point, 5f))
                                 {
-                                    Message(player, msg("ZoneExists", player.UserIDString));
+                                    Message(user, "ZoneExists");
                                     return;
                                 }
 
@@ -3861,7 +4158,7 @@ namespace Oxide.Plugins
 
                                 var _nameArgs = args.Where(arg => arg.ToLower() != "tp" && arg != radius.ToString());
                                 var name = _nameArgs.Count() > 0 ? string.Join(" ", _nameArgs) : null;
-                                var zone = SetupDuelZone(hit.point, null, GetZoneName(name, radius));
+                                var zone = SetupDuelZone(hit.point, GetZoneName(name, radius));
                                 int i = 0;
 
                                 foreach (var spawn in zone.Spawns)
@@ -3869,60 +4166,53 @@ namespace Oxide.Plugins
 
                                 UpdateStability();
 
-                                if (zoneCounter > 0) Message(player, $"Zone will reset after {zoneCounter} duels. Disable by setting `Create New Zone Every X Duels [0 = disabled]` to `0` in the config.");
+                                if (zoneCounter > 0) MessageB(player, $"Zone will reset after {zoneCounter} duels. Disable by setting `Create New Zone Every X Duels [0 = disabled]` to `0` in the config.");
                             }
-                            else
-                                Message(player, msg("FailedRaycast", player.UserIDString));
+                            else Message(player, "FailedRaycast");
                         }
                         break;
                     }
                 case "remove":
                     {
-                        if (player.IsAdmin)
+                        if (isAllowed)
                         {
-                            if (duelingZones.Count > 0)
+                            var zone = GetDuelZone(player.transform.position);
+                            if (zone == null)
                             {
-                                var zone = GetDuelZone(player.transform.position);
-
-                                if (zone == null)
-                                {
-                                    Message(player, msg("NoZoneFound", player.UserIDString));
-                                    return;
-                                }
-
-                                EjectPlayers(zone);
-                                RemoveDuelZone(zone);
-                                Message(player, msg("RemovedZone", player.UserIDString));
+                                Message(user, "NoZoneFound");
+                                return;
                             }
 
+                            EjectPlayers(zone);
+                            RemoveDuelZone(zone);
+                            Message(user, "RemovedZone");
                         }
                         break;
                     }
                 case "removeall":
                     {
-                        if (player.IsAdmin)
+                        if (user.IsAdmin)
                         {
                             if (duelingZones.Count > 0)
                             {
-                                using var zones = GetPool(duelingZones);
+                                using var zones = GetPooledList(duelingZones);
                                 foreach (var zone in zones)
                                 {
                                     EjectPlayers(zone);
-                                    Message(player, msg("RemovedZoneAt", player.UserIDString, zone.Position));
+                                    Message(user, "RemovedZoneAt", zone.Location);
                                     RemoveDuelZone(zone);
                                 }
 
-                                duelsData.Zones.Clear();
+                                data.Zones.Clear();
                                 SaveData();
                             }
-                            else
-                                Message(player, msg("NoZoneExists", player.UserIDString));
+                            else Message(user, "NoZoneExists");
                         }
                         break;
                     }
                 case "spawns":
                     {
-                        if (player.IsAdmin)
+                        if (isAllowed)
                         {
                             if (args.Length >= 2)
                             {
@@ -3973,33 +4263,28 @@ namespace Oxide.Plugins
 
                             if (destZone != null)
                                 foreach (var spawn in destZone.Spawns)
-                                    player.SendConsoleCommand("ddraw.text", 30f, Color.yellow, spawn, ++i);
+                                    player.SendConsoleCommand("ddraw.text", 30f, Color.yellow, spawn, "<size=24>" + (++i) + "</size>");
                         }
                         break;
                     }
                 case "rename":
                     {
-                        if (player.IsAdmin)
+                        if (isAllowed)
                         {
                             if (args.Length > 1)
                             {
                                 var zone = GetDuelZone(player.transform.position);
 
-                                if (zone == null)
+                                if (zone == null || !data.Zones.TryGetValue(zone.Location, out var info))
                                 {
-                                    Message(player, msg("NoZoneFound", player.UserIDString));
+                                    Message(user, "NoZoneFound");
                                     return;
                                 }
 
-                                string zoneName = string.Join(" ", args.Skip(1));
-                                float radius = zoneRadius;
-                                string key = zone.Position.ToString();
-                                if (duelsData.Zones.TryGetValue(key, out var r)) radius = r.radius;
-                                duelsData.Zones[key] = new(zoneName, radius);
-                                Message(player, msg("ZoneRenamed", player.UserIDString, zoneName));
+                                info.name = string.Join(" ", args.Skip(1));
+                                Message(user, "ZoneRenamed", info.name);
                             }
-                            else
-                                Message(player, msg("ZoneRename", player.UserIDString, szDuelChatCommand));
+                            else Message(user, "ZoneRename", szDuelChatCommand);
 
                             return;
                         }
@@ -4007,11 +4292,11 @@ namespace Oxide.Plugins
                     }
                 case "new":
                     {
-                        if (player.IsAdmin)
+                        if (user.IsAdmin)
                         {
-                            if (duelsData.Zones.Count >= zoneAmount)
+                            if (data.Zones.Count >= zoneAmount)
                             {
-                                Message(player, msg("ZoneLimit", player.UserIDString, zoneAmount));
+                                Message(user, "ZoneLimit", zoneAmount);
                                 return;
                             }
 
@@ -4027,29 +4312,27 @@ namespace Oxide.Plugins
 
                             var _nameArgs = args.Where(arg => arg.ToLower() != "tp" && arg != radius.ToString());
                             var name = _nameArgs.Count() > 0 ? string.Join(" ", _nameArgs) : null;
-                            var zone = GetZoneName(name, radius);
-                            var zonePos = SetupDuelZone(null, zone);
+                            var zone = SetupDuelZone(GetZoneName(name, radius));
 
-                            if (zonePos != Vector3.zero)
+                            if (zone != null)
                             {
-                                Message(player, msg("ZoneCreated", player.UserIDString));
+                                Message(user, "ZoneCreated");
 
-                                if (args.Exists(arg => arg.ToLower() == "tp"))
+                                if (player != null && Array.Exists(args, arg => arg.ToLower() == "tp"))
                                 {
-                                    Player.Teleport(player, zonePos);
+                                    Player.Teleport(player, zone.Location);
                                 }
                             }
-
                         }
                         break;
                     }
                 case "tpm":
                     {
-                        if (player.IsAdmin)
+                        if (isAllowed)
                         {
                             float dist = float.MaxValue;
                             var dest = Vector3.zero;
-                            using var matches = GetPool(tdmMatches.Exists(m => m.IsStarted) ? tdmMatches.Where(m => m.IsStarted) : tdmMatches); // 0.1.17 if multiple zones then choose from active ones if any exist
+                            using var matches = GetPooledList(tdmMatches.Exists(m => m.IsStarted) ? tdmMatches.Where(m => m.IsStarted) : tdmMatches); // 0.1.17 if multiple zones then choose from active ones if any exist
 
                             foreach (var match in matches)
                             {
@@ -4061,7 +4344,7 @@ namespace Oxide.Plugins
                                 if (distance < dist)
                                 {
                                     dist = distance;
-                                    dest = match.Zone.Position;
+                                    dest = match.Zone.Location;
                                 }
                             }
 
@@ -4072,61 +4355,61 @@ namespace Oxide.Plugins
                     }
                 case "tp":
                     {
-                        if (player.IsAdmin)
+                        if (isAllowed && duelingZones.Count > 0)
                         {
-                            float dist = float.MaxValue;
-                            var dest = Vector3.zero;
-                            using var zones = GetPool(duelingZones.Count > 3 && duelingZones.Exists(zone => zone.TotalPlayers > 0) ? duelingZones.Where(zone => zone.TotalPlayers > 0) : duelingZones); // 0.1.17 if multiple zones then choose from active ones if any exist
-
-                            foreach (var zone in zones)
+                            if (args.Length == 2 && int.TryParse(args[1], out int idx))
                             {
-                                float distance = zone.Distance(player.transform.position);
+                                Player.Teleport(player, duelingZones[Math.Clamp(idx, 0, duelingZones.Count - 1)].Location);
+                                return;
+                            }
 
-                                if (zones.Count > 1 && distance < zone.ProtectionRadius * 4f) // move admin to the next nearest zone
-                                    continue;
-
-                                if (distance < dist)
+                            int currIdx = -1;
+                            for (int i = 0; i < duelingZones.Count; i++)
+                            {
+                                DuelingZone z = duelingZones[i];
+                                if (z.InRange(player.transform.position))
                                 {
-                                    dist = distance;
-                                    dest = zone.Position;
+                                    currIdx = i;
+                                    break;
                                 }
                             }
 
-                            if (dest != Vector3.zero)
-                                Player.Teleport(player, dest);
+                            int nextIdx = currIdx < 0 ? 0 : (currIdx + 1) % duelingZones.Count;
+                            Player.Teleport(player, duelingZones[nextIdx].Location);
+                            player.ChatMessage($"Teleported to zone {duelingZones[nextIdx].zoneName} @ {duelingZones[nextIdx].Location}");
                         }
                         break;
                     }
                 case "save":
                     {
-                        if (player.IsAdmin)
+                        if (user.IsAdmin)
                         {
                             SaveData();
-                            Message(player, msg("DataSaved", player.UserIDString));
+                            Message(user, "DataSaved");
                         }
                     }
                     break;
                 case "ban":
                     {
-                        if (player.IsAdmin && args.Length >= 2)
+                        if (user.IsAdmin && args.Length >= 2)
                         {
                             string targetId = args[1].IsSteamId() ? args[1] : BasePlayer.Find(args[1])?.UserIDString ?? null;
 
                             if (string.IsNullOrEmpty(targetId))
                             {
-                                Message(player, msg("PlayerNotFound", player.UserIDString, args[1]));
+                                Message(user, "PlayerNotFound", args[1]);
                                 return;
                             }
 
-                            if (!duelsData.Bans.ContainsKey(targetId))
+                            if (!data.Bans.ContainsKey(targetId))
                             {
-                                duelsData.Bans.Add(targetId, player.UserIDString);
-                                Message(player, msg("AddedBan", player.UserIDString, targetId));
+                                data.Bans.Add(targetId, user.Id);
+                                Message(user, "AddedBan", targetId);
                             }
                             else
                             {
-                                duelsData.Bans.Remove(targetId);
-                                Message(player, msg("RemovedBan", player.UserIDString, targetId));
+                                data.Bans.Remove(targetId);
+                                Message(user, "RemovedBan", targetId);
                             }
 
                             SaveData();
@@ -4135,28 +4418,31 @@ namespace Oxide.Plugins
                     }
                 case "announce":
                     {
-                        if (player.IsAdmin)
+                        if (user.IsAdmin)
                             DuelAnnouncement(true);
 
                         break;
                     }
                 case "claim":
                     {
-                        if (!duelsData.ClaimBets.TryGetValue(player.UserIDString, out var claim))
+                        if (isLimited || !player)
                         {
-                            Message(player, msg("NoBetsToClaim", player.UserIDString));
                             return;
                         }
 
-                        using var bets = GetPool(claim);
+                        if (!data.ClaimBets.TryGetValue(user.Id, out var claim))
+                        {
+                            Message(user, "NoBetsToClaim");
+                            return;
+                        }
+
+                        using var bets = GetPooledList(claim);
                         foreach (var bet in bets)
                         {
-                            var item = ItemManager.CreateByItemID(bet.itemid, bet.amount);
+                            var item = ItemManager.CreateByItemID(bet.itemid, bet.amount ?? 1);
 
                             if (item == null)
-                            {
                                 continue;
-                            }
 
                             if (!item.MoveToContainer(player.inventory.containerMain, -1))
                             {
@@ -4164,16 +4450,16 @@ namespace Oxide.Plugins
                                 item.Drop(position + new Vector3(0f, 1f, 0f) + position / 2f, (position + new Vector3(0f, 0.2f, 0f)) * 8f); // Credit: Slack comment by @visagalis
                             }
 
-                            string message = msg("PlayerClaimedBet", player.UserIDString, item.info.displayName.translated, item.amount);
+                            string message = msg("PlayerClaimedBet", user.Id, item.info.displayName.translated, item.amount);
 
-                            Message(player, message);
-                            Puts("{0} ({1}) - {2}", player.displayName, player.UserIDString, message);
+                            MessageB(player, message);
+                            Puts("{0} ({1}) - {2}", user.Name, user.Id, message);
                             claim.Remove(bet);
 
                             if (claim.Count == 0)
                             {
-                                duelsData.ClaimBets.Remove(player.UserIDString);
-                                Message(player, msg("AllBetsClaimed", player.UserIDString));
+                                data.ClaimBets.Remove(user.Id);
+                                Message(player, "AllBetsClaimed");
                             }
                         }
                         return;
@@ -4182,71 +4468,85 @@ namespace Oxide.Plugins
                 case "que":
                 case "q":
                     {
-                        if (!string.IsNullOrEmpty(szQueueChatCommand))
-                            cmdQueue(player, command, args);
+                        if (player != null && !IsDueling(player) && !string.IsNullOrEmpty(szQueueChatCommand))
+                            CommandQueue(user, command, args);
                         return;
                     }
                 case "chat":
                     {
                         if (broadcastDefeat)
                         {
-                            if (!duelsData.Chat.Contains(player.UserIDString))
-                                duelsData.Chat.Add(player.UserIDString);
-                            else
-                                duelsData.Chat.Remove(player.UserIDString);
+                            if (!data.Chat.Contains(user.Id))
+                                data.Chat.Add(user.Id);
+                            else data.Chat.Remove(user.Id);
 
-                            Message(player, msg(duelsData.Chat.Contains(player.UserIDString) ? "DuelChatOff" : "DuelChatOn", player.UserIDString));
+                            Message(user, data.Chat.Contains(user.Id) ? "DuelChatOff" : "DuelChatOn");
                         }
                         else
                         {
-                            if (!duelsData.ChatEx.Contains(player.UserIDString))
-                                duelsData.ChatEx.Add(player.UserIDString);
-                            else
-                                duelsData.ChatEx.Remove(player.UserIDString);
+                            if (!data.ChatEx.Contains(user.Id))
+                                data.ChatEx.Add(user.Id);
+                            else data.ChatEx.Remove(user.Id);
 
-                            Message(player, msg(duelsData.ChatEx.Contains(player.UserIDString) ? "DuelChatOn" : "DuelChatOff", player.UserIDString));
+                            Message(user, data.ChatEx.Contains(user.Id) ? "DuelChatOn" : "DuelChatOff");
                         }
                         return;
                     }
                 case "kit":
                     {
-                        string kits = string.Join(", ", VerifiedKits.ToArray());
+                        if (isLimited || !player)
+                        {
+                            return;
+                        }
+
+                        string kits = string.Join(", ", VerifiedKits);
 
                         if (args.Length == 2 && !string.IsNullOrEmpty(kits))
                         {
-                            string kit = GetVerifiedKit(args[1]);
+                            string kit = GetVerifiedKit(args[1]); // Duel
 
                             if (!string.IsNullOrEmpty(kit))
                             {
-                                duelsData.CustomKits[player.UserIDString] = kit;
-                                Message(player, msg("KitSet", player.UserIDString, kit));
+                                data.CustomKits[user.Id] = kit;
+                                Message(user, "KitSet", kit);
                             }
                             else
-                                Message(player, msg("KitDoesntExist", player.UserIDString, args[1]));
+                                Message(user, "KitDoesntExist", args[1]);
 
                             return;
                         }
 
-                        if (duelsData.CustomKits.ContainsKey(player.UserIDString))
+                        if (data.CustomKits.Remove(user.Id))
                         {
-                            duelsData.CustomKits.Remove(player.UserIDString);
-                            Message(player, msg("ResetKit", player.UserIDString));
+                            Message(user, "ResetKit");
                         }
 
-                        Message(player, string.IsNullOrEmpty(kits) ? msg("KitsNotConfigured", player.UserIDString) : "Kits: " + kits);
+                        if (string.IsNullOrEmpty(kits)) Message(user, "KitsNotConfigured");
+                        else MessageB(player, kits);
                         return;
                     }
                 case "allow":
                     {
-                        if (!duelsData.Allowed.Contains(player.UserIDString))
+                        if (isLimited)
                         {
-                            duelsData.Allowed.Add(player.UserIDString);
-                            Message(player, msg("PlayerRequestsOn", player.UserIDString));
                             return;
                         }
 
-                        duelsData.Allowed.Remove(player.UserIDString);
-                        Message(player, msg("PlayerRequestsOff", player.UserIDString));
+                        if (autoAllowAll)
+                        {
+                            Message(user, "PlayerRequestsAuto");
+                            return;
+                        }
+
+                        if (!data.Allowed.Contains(user.Id))
+                        {
+                            data.Allowed.Add(user.Id);
+                            Message(user, "PlayerRequestsOn");
+                            return;
+                        }
+
+                        data.Allowed.Remove(user.Id);
+                        Message(user, "PlayerRequestsOff");
                         RemoveRequests(player);
                         return;
                     }
@@ -4258,52 +4558,56 @@ namespace Oxide.Plugins
 
                             if (IsNull(target))
                             {
-                                Message(player, msg("PlayerNotFound", player.UserIDString, args[1]));
+                                Message(user, "PlayerNotFound", args[1]);
                                 return;
                             }
 
-                            if (!duelsData.BlockedUsers.ContainsKey(player.UserIDString))
+                            if (!data.BlockedUsers.TryGetValue(user.Id, out var block))
                             {
-                                duelsData.BlockedUsers.Add(player.UserIDString, new());
+                                data.BlockedUsers.Add(user.Id, block = new());
                             }
-                            else if (duelsData.BlockedUsers[player.UserIDString].Contains(target.UserIDString))
+                            else if (block.Contains(target.UserIDString))
                             {
-                                duelsData.BlockedUsers[player.UserIDString].Remove(target.UserIDString);
+                                block.Remove(target.UserIDString);
 
-                                if (duelsData.BlockedUsers[player.UserIDString].Count == 0)
-                                    duelsData.BlockedUsers.Remove(player.UserIDString);
+                                if (block.Count == 0)
+                                    data.BlockedUsers.Remove(user.Id);
 
-                                Message(player, msg("UnblockedRequestsFrom", player.UserIDString, target.displayName));
+                                Message(user, "UnblockedRequestsFrom", target.displayName);
                                 return;
                             }
 
-                            duelsData.BlockedUsers[player.UserIDString].Add(target.UserIDString);
-                            Message(player, msg("BlockedRequestsFrom", player.UserIDString, target.displayName));
+                            block.Add(target.UserIDString);
+                            Message(user, "BlockedRequestsFrom", target.displayName);
                             return;
                         }
 
-                        if (duelsData.Allowed.Contains(player.UserIDString))
+                        if (!autoAllowAll && data.Allowed.Remove(user.Id))
                         {
-                            duelsData.Allowed.Remove(player.UserIDString);
-                            Message(player, msg("PlayerRequestsOff", player.UserIDString));
+                            Message(user, "PlayerRequestsOff");
                             RemoveRequests(player);
                             return;
                         }
 
-                        Message(player, msg("AlreadyBlocked", player.UserIDString));
+                        Message(user, "AlreadyBlocked");
                         return;
                     }
                 case "bet":
                     {
+                        if (isLimited)
+                        {
+                            return;
+                        }
+
                         if (!allowBets)
                         {
-                            Message(player, "Betting is disabled.");
+                            Message(user, "Betting is disabled.");
                             break;
                         }
 
                         if (duelingBets.Count == 0)
                         {
-                            Message(player, msg("NoBetsConfigured", player.UserIDString));
+                            Message(user, "NoBetsConfigured");
                             return;
                         }
 
@@ -4313,22 +4617,21 @@ namespace Oxide.Plugins
                             {
                                 case "refundall":
                                     {
-                                        if (player.IsAdmin)
+                                        if (user.IsAdmin)
                                         {
-                                            if (duelsData.Bets.Count == 0)
+                                            if (data.Bets.Count == 0)
                                             {
-                                                Message(player, msg("NoBetsToRefund", player.UserIDString));
+                                                Message(user, "NoBetsToRefund");
                                                 return;
                                             }
 
-                                            using var bets = GetPool(duelsData.Bets);
+                                            using var bets = GetPooledList(data.Bets);
                                             foreach (var (userid, bet) in bets)
                                             {
                                                 var target = BasePlayer.Find(userid);
                                                 if (target == null) continue;
 
-                                                Item item = ItemManager.CreateByItemID(bet.itemid, bet.amount);
-
+                                                Item item = ItemManager.CreateByItemID(bet.itemid, bet.amount ?? 1);
                                                 if (item == null)
                                                     continue;
 
@@ -4338,13 +4641,13 @@ namespace Oxide.Plugins
                                                     continue;
                                                 }
 
-                                                Message(target, msg("RefundAllPlayerNotice", target.UserIDString, item.info.displayName.translated, item.amount));
-                                                Message(player, msg("RefundAllAdminNotice", player.UserIDString, target.displayName, target.UserIDString, item.info.displayName.english, item.amount));
-                                                duelsData.Bets.Remove(userid);
+                                                Message(target, "RefundAllPlayerNotice", item.info.displayName.translated, item.amount);
+                                                Message(player, "RefundAllAdminNotice", target.displayName, target.UserIDString, item.info.displayName.english, item.amount);
+                                                data.Bets.Remove(userid);
                                             }
 
-                                            if (duelsData.Bets.Count > 0) Message(player, msg("BetsRemaining", player.UserIDString, duelsData.Bets.Count));
-                                            else Message(player, msg("AllBetsRefunded", player.UserIDString));
+                                            if (data.Bets.Count > 0) Message(user, "BetsRemaining", data.Bets.Count);
+                                            else Message(user, "AllBetsRefunded");
                                             SaveData();
                                             return;
                                         }
@@ -4355,65 +4658,64 @@ namespace Oxide.Plugins
                                     {
                                         if (allowBetRefund) // prevent operator error ;)
                                         {
-                                            cmdDuel(player, command, new[] { "bet", "refund" });
+                                            CommandDuelist(user, command, new[] { "bet", "refund" });
                                             return;
                                         }
 
                                         if (!allowBetForfeit)
                                         {
-                                            Message(player, msg("CannotForfeit", player.UserIDString));
+                                            Message(user, "CannotForfeit");
                                             return;
                                         }
 
-                                        if (duelsData.Bets.ContainsKey(player.UserIDString))
+                                        if (data.Bets.ContainsKey(user.Id))
                                         {
-                                            if (dataRequests.ContainsKey(player.UserIDString) || dataRequests.ContainsValue(player.UserIDString))
+                                            if (HasRequest(user.Id))
                                             {
-                                                Message(player, msg("CannotForfeitRequestDuel", player.UserIDString));
+                                                Message(user, "CannotForfeitRequestDuel");
                                                 return;
                                             }
 
-                                            if (dataDuelists.ContainsKey(player.UserIDString))
+                                            if (IsDuelist(user.Id))
                                             {
-                                                Message(player, msg("CannotForfeitInDuel", player.UserIDString));
+                                                Message(user, "CannotForfeitInDuel");
                                                 return;
                                             }
 
-                                            duelsData.Bets.Remove(player.UserIDString);
-                                            Message(player, msg("BetForfeit", player.UserIDString));
+                                            data.Bets.Remove(user.Id);
+                                            Message(user, "BetForfeit");
                                             SaveData();
                                         }
-                                        else
-                                            Message(player, msg("NoBetToForfeit", player.UserIDString));
+                                        else Message(user, "NoBetToForfeit");
 
                                         return;
                                     }
                                 case "cancel":
                                 case "refund":
                                     {
-                                        if (!allowBetRefund && !player.IsAdmin)
+                                        if (!allowBetRefund && !user.IsAdmin)
                                         {
-                                            Message(player, msg("CannotRefund", player.UserIDString));
+                                            Message(user, "CannotRefund");
                                             return;
                                         }
 
-                                        if (duelsData.Bets.ContainsKey(player.UserIDString))
+                                        if (player != null && data.Bets.ContainsKey(user.Id))
                                         {
-                                            if (dataRequests.ContainsKey(player.UserIDString) || dataRequests.ContainsValue(player.UserIDString))
+                                            if (HasRequest(user.Id))
                                             {
-                                                Message(player, msg("CannotRefundRequestDuel", player.UserIDString));
+                                                Message(user, "CannotRefundRequestDuel");
                                                 return;
                                             }
 
-                                            if (dataDuelists.ContainsKey(player.UserIDString))
+                                            if (IsDuelist(user.Id))
                                             {
-                                                Message(player, msg("CannotRefundInDuel", player.UserIDString));
+                                                Message(user, "CannotRefundInDuel");
                                                 return;
                                             }
 
-                                            var bet = duelsData.Bets[player.UserIDString];
+                                            var bet = data.Bets[user.Id];
 
-                                            Item item = ItemManager.CreateByItemID(bet.itemid, bet.amount);
+                                            Item item = ItemManager.CreateByItemID(bet.itemid, bet.amount ?? 1);
 
                                             if (!item.MoveToContainer(player.inventory.containerMain, -1, true))
                                             {
@@ -4424,12 +4726,11 @@ namespace Oxide.Plugins
                                                 }
                                             }
 
-                                            duelsData.Bets.Remove(player.UserIDString);
-                                            Message(player, msg("BetRefunded", player.UserIDString));
+                                            data.Bets.Remove(user.Id);
+                                            Message(user, "BetRefunded");
                                             SaveData();
                                         }
-                                        else
-                                            Message(player, msg("NoBetToRefund", player.UserIDString));
+                                        else Message(user, "NoBetToRefund");
 
                                         return;
                                     }
@@ -4438,53 +4739,51 @@ namespace Oxide.Plugins
                             }
                         }
 
-                        if (duelsData.Bets.ContainsKey(player.UserIDString))
+                        if (data.Bets.TryGetValue(user.Id, out var b))
                         {
-                            var bet = duelsData.Bets[player.UserIDString];
-
-                            Message(player, msg("AlreadyBetting", player.UserIDString, bet.trigger, bet.amount));
-
-                            if (allowBetRefund)
-                                Message(player, msg("ToRefundUse", player.UserIDString, szDuelChatCommand));
-                            else if (allowBetForfeit)
-                                Message(player, msg("ToForfeitUse", player.UserIDString, szDuelChatCommand));
+                            Message(user, "AlreadyBetting", b.trigger, b.amount);
+                            if (allowBetRefund) Message(user, "ToRefundUse", szDuelChatCommand);
+                            else if (allowBetForfeit) Message(user, "ToForfeitUse", szDuelChatCommand);
 
                             return;
                         }
 
                         if (args.Length < 3)
                         {
-                            Message(player, msg("AvailableBets", player.UserIDString));
+                            Message(user, "AvailableBets");
 
                             foreach (var betInfo in duelingBets)
-                                Message(player, string.Format("{0} (max: {1})", betInfo.trigger, betInfo.max));
+                                Message(user, $"{betInfo.trigger} (max: {betInfo.max})");
 
-                            Message(player, msg("BetSyntax", player.UserIDString, szDuelChatCommand));
+                            Message(user, "BetSyntax", szDuelChatCommand);
                             return;
                         }
 
                         if (!int.TryParse(args[2], out var betAmount))
                         {
-                            Message(player, msg("InvalidNumber", player.UserIDString, args[2]));
+                            Message(user, "InvalidNumber", args[2]);
                             return;
                         }
 
                         if (betAmount > 500 && betAmount % 500 != 0)
                         {
-                            Message(player, msg("MultiplesOnly", player.UserIDString));
+                            Message(user, "MultiplesOnly");
                             return;
                         }
 
-                        foreach (var betInfo in duelingBets)
+                        if (player != null)
                         {
-                            if (betInfo.trigger.ToLower() == args[1].ToLower())
+                            foreach (var betInfo in duelingBets)
                             {
-                                CreateBet(player, betAmount, betInfo);
-                                return;
+                                if (betInfo.trigger.ToLower() == args[1].ToLower())
+                                {
+                                    CreateBet(player, betAmount, betInfo);
+                                    return;
+                                }
                             }
                         }
 
-                        Message(player, msg("InvalidBet", player.UserIDString, args[1]));
+                        Message(user, "InvalidBet", args[1]);
                         return;
                     }
                 case "accept":
@@ -4492,63 +4791,57 @@ namespace Oxide.Plugins
                 case "y":
                 case "yes":
                     {
-                        if (!autoAllowAll && !duelsData.Allowed.Contains(player.UserIDString))
+                        if (isLimited || !player)
                         {
-                            Message(player, msg("MustAllowDuels", player.UserIDString, szDuelChatCommand));
                             return;
                         }
 
-                        if (InEvent(player))
+                        if (!DuelsEnabled(user.Id))
                         {
-                            Message(player, msg("AlreadyDueling", player.UserIDString));
+                            Message(user, "MustAllowDuels", szDuelChatCommand);
                             return;
                         }
 
-                        if (!dataRequests.ContainsValue(player.UserIDString))
+                        if (IsParticipant(player))
                         {
-                            Message(player, msg("NoRequestsReceived", player.UserIDString));
+                            Message(user, "AlreadyDueling");
+                            return;
+                        }
+
+                        if (!GetPendingRequest(user.Id, out var request))
+                        {
+                            Message(user, "NoRequestsReceived");
                             return;
                         }
 
                         if (!IsNewman(player))
                         {
-                            Message(player, msg("MustBeNaked", player.UserIDString));
+                            Message(user, "MustBeNaked");
                             return;
                         }
 
-                        BasePlayer target = null;
-
-                        foreach (var kvp in dataRequests)
+                        BasePlayer target = request.Key.GetPlayer();
+                        if (target == null || !target.IsConnected)
                         {
-                            if (kvp.Value == player.UserIDString)
-                            {
-                                target = BasePlayer.Find(kvp.Key);
-
-                                if (target == null || !target.IsConnected)
-                                {
-                                    Message(player, string.Format("DuelCancelledFor", player.UserIDString, GetDisplayName(kvp.Key)));
-                                    dataRequests.Remove(kvp.Key);
-                                    return;
-                                }
-
-                                break;
-                            }
+                            Message(user, "DuelCancelledFor", request.Key.Name);
+                            dataRequests.Remove(request.Key);
+                            return;
                         }
 
                         if (!IsNewman(target))
                         {
-                            Message(player, msg("TargetMustBeNaked", player.UserIDString));
-                            Message(target, msg("MustBeNaked", target.UserIDString));
+                            Message(user, "TargetMustBeNaked");
+                            Message(target, "MustBeNaked");
                             return;
                         }
 
-                        duelsData.Restricted.Remove(player.UserIDString);
-                        duelsData.Restricted.Remove(target.UserIDString);
+                        data.Restricted.Remove(user.Id);
+                        data.Restricted.Remove(target.UserIDString);
 
-                        if (!SelectZone(player, target))
+                        if (!SelectZone(player, target, false))
                         {
-                            Message(player, msg("AllZonesFull", player.UserIDString, duelingZones.Count, playersPerZone));
-                            Message(target, msg("AllZonesFull", target.UserIDString, duelingZones.Count, playersPerZone));
+                            Message(player, "AllZonesFull", duelingZones.Count, playersPerZone);
+                            Message(target, "AllZonesFull", duelingZones.Count, playersPerZone);
                         }
 
                         return;
@@ -4556,55 +4849,60 @@ namespace Oxide.Plugins
                 case "cancel":
                 case "decline":
                     {
+                        if (!player) return;
                         if (IsDueling(player))
-                            return;
-
-                        if (!autoAllowAll && !duelsData.Allowed.Contains(player.UserIDString))
                         {
-                            Message(player, msg("MustAllowDuels", player.UserIDString, szDuelChatCommand));
+                            LeaveEvent(player);
+                            return;
+                        }
+                        else if (GetRequest(user.Id, out var request))
+                        {
+                            if (request.Key.ID != user.Id)
+                                Message(request.Key.Player, "DuelCancelledWith", user.Name);
+                            else Message(request.Value.Player, "DuelCancelledWith", user.Name);
+
+                            Message(user, "DuelCancelComplete");
+                            dataRequests.Remove(request.Key);
                             return;
                         }
 
-                        var entry = dataRequests.FirstOrDefault(kvp => dataRequests.ContainsKey(player.UserIDString) ? kvp.Key == player.UserIDString : kvp.Value == player.UserIDString);
-
-                        if (!string.IsNullOrEmpty(entry.Key))
-                        {
-                            var target = BasePlayer.Find(entry.Key) ?? BasePlayer.Find(entry.Value);
-
-                            if (target != null)
-                                Message(target, msg("DuelCancelledWith", target.UserIDString, player.displayName));
-
-                            Message(player, msg("DuelCancelComplete", player.UserIDString));
-                            dataRequests.Remove(entry.Key);
-                            return;
-                        }
-
-                        Message(player, msg("NoPendingRequests", player.UserIDString));
+                        Message(user, "NoPendingRequests");
                         return;
                     }
                 default:
                     {
-                        if (!autoAllowAll && !duelsData.Allowed.Contains(player.UserIDString))
+                        if (user.IsServer)
                         {
-                            Message(player, msg("MustAllowDuels", player.UserIDString, szDuelChatCommand));
+                            user.Reply(string.Format("{0} on|off|new|removeall|resetseed", szDuelChatCommand));
+                            return;
+                        }
+
+                        if (isLimited)
+                        {
+                            return;
+                        }
+
+                        if (!DuelsEnabled(user.Id))
+                        {
+                            Message(user, "MustAllowDuels", szDuelChatCommand);
                             return;
                         }
 
                         if (IsDueling(player))
                         {
-                            Message(player, msg("AlreadyDueling", player.UserIDString));
+                            Message(user, "AlreadyDueling");
                             return;
                         }
 
-                        if (duelsData.Restricted.Contains(player.UserIDString) && !player.IsAdmin)
+                        if (data.Restricted.Contains(user.Id) && !user.IsAdmin)
                         {
-                            Message(player, msg("MustWaitToRequestAgain", player.UserIDString, 1));
+                            Message(user, "MustWaitToRequestAgain", 1);
                             return;
                         }
 
                         if (!IsNewman(player))
                         {
-                            Message(player, msg("MustBeNaked", player.UserIDString));
+                            Message(user, "MustBeNaked");
                             return;
                         }
 
@@ -4612,64 +4910,64 @@ namespace Oxide.Plugins
 
                         if (target == null || target == player) //if (target == null || (target == player && target.userID != 76561198212544308))
                         {
-                            Message(player, msg("PlayerNotFound", player.UserIDString, args[0]));
+                            Message(user, "PlayerNotFound", args[0]);
                             return;
                         }
 
-                        if (duelsData.BlockedUsers.ContainsKey(target.UserIDString) && duelsData.BlockedUsers[target.UserIDString].Contains(player.UserIDString))
+                        if (data.BlockedUsers.ContainsKey(target.UserIDString) && data.BlockedUsers[target.UserIDString].Contains(user.Id))
                         {
-                            Message(player, msg("CannotRequestThisPlayer", player.UserIDString));
+                            Message(user, "CannotRequestThisPlayer");
                             return;
                         }
 
                         if (IsDueling(target))
                         {
-                            Message(player, msg("TargetAlreadyDueling", player.UserIDString, target.displayName));
+                            Message(user, "TargetAlreadyDueling", target.displayName);
                             return;
                         }
 
-                        if (!autoAllowAll && !duelsData.Allowed.Contains(target.UserIDString))
+                        if (!DuelsEnabled(target.UserIDString))
                         {
-                            Message(player, msg("NotAllowedYet", player.UserIDString, target.displayName, szDuelChatCommand));
+                            Message(user, "NotAllowedYet", target.displayName, szDuelChatCommand);
                             return;
                         }
 
-                        if (dataRequests.ContainsKey(player.UserIDString))
+                        if (GetInitiatedRequest(user.Id, out var request))
                         {
-                            Message(player, msg("MustWaitForAccept", player.UserIDString, GetDisplayName(dataRequests[player.UserIDString])));
+                            Message(user, "MustWaitForAccept", request.Value.Name);
                             return;
                         }
 
-                        if (dataRequests.ContainsValue(target.UserIDString))
+                        if (GetPendingRequest(target.UserIDString, out request))
                         {
-                            Message(player, msg("PendingRequestAlready", player.UserIDString));
+                            Message(user, "PendingRequestAlready");
                             return;
                         }
 
-                        if (duelsData.Bets.ContainsKey(player.UserIDString) && !duelsData.Bets.ContainsKey(target.UserIDString))
+                        if (data.Bets.ContainsKey(user.Id) && !data.Bets.ContainsKey(target.UserIDString))
                         {
-                            var bet = duelsData.Bets[player.UserIDString];
+                            var bet = data.Bets[user.Id];
 
-                            Message(player, msg("TargetHasNoBet", player.UserIDString, target.displayName));
-                            Message(player, msg("YourBet", player.UserIDString, bet.trigger, bet.amount));
+                            Message(user, "TargetHasNoBet", target.displayName);
+                            Message(user, "YourBet", bet.trigger, bet.amount);
                             return;
                         }
 
-                        if (duelsData.Bets.ContainsKey(target.UserIDString) && !duelsData.Bets.ContainsKey(player.UserIDString))
+                        if (data.Bets.ContainsKey(target.UserIDString) && !data.Bets.ContainsKey(user.Id))
                         {
-                            var targetBet = duelsData.Bets[target.UserIDString];
-                            Message(player, msg("MustHaveSameBet", player.UserIDString, target.displayName, targetBet.trigger, targetBet.amount));
+                            var targetBet = data.Bets[target.UserIDString];
+                            Message(user, "MustHaveSameBet", target.displayName, targetBet.trigger, targetBet.amount);
                             return;
                         }
 
-                        if (duelsData.Bets.ContainsKey(player.UserIDString) && duelsData.Bets.ContainsKey(target.UserIDString))
+                        if (data.Bets.ContainsKey(user.Id) && data.Bets.ContainsKey(target.UserIDString))
                         {
-                            var playerBet = duelsData.Bets[player.UserIDString];
-                            var targetBet = duelsData.Bets[target.UserIDString];
+                            var playerBet = data.Bets[user.Id];
+                            var targetBet = data.Bets[target.UserIDString];
 
                             if (!playerBet.Equals(targetBet))
                             {
-                                Message(player, msg("BetsDoNotMatch", player.UserIDString, playerBet.trigger, playerBet.amount, targetBet.trigger, targetBet.amount));
+                                Message(user, "BetsDoNotMatch", playerBet.trigger, playerBet.amount, targetBet.trigger, targetBet.amount);
                                 return;
                             }
                         }
@@ -4677,29 +4975,26 @@ namespace Oxide.Plugins
                         if (args.Length > 1)
                             SetPlayerZone(player, args.Skip(1));
 
-                        dataRequests.Add(player.UserIDString, target.UserIDString);
-                        Message(target, msg("DuelRequestReceived", target.UserIDString, player.displayName, szDuelChatCommand));
-                        Message(player, msg("DuelRequestSent", player.UserIDString, target.displayName, szDuelChatCommand));
+                        PlayerData playerData = new(player);
+                        PlayerData targetData = new(target);
+                        dataRequests[playerData] = targetData;
+                        Message(target, "DuelRequestReceived", player.displayName, szDuelChatCommand);
+                        Message(player, "DuelRequestSent", target.displayName, szDuelChatCommand);
 
-                        if (RemoveFromQueue(player.UserIDString))
-                            Message(player, msg("RemovedFromQueueRequest", player.UserIDString));
+                        if (RemoveFromQueue(user.Id))
+                            Message(user, "RemovedFromQueueRequest");
 
-                        string targetName = target.displayName;
-                        string playerId = player.UserIDString;
-
-                        if (!duelsData.Restricted.Contains(playerId))
-                            duelsData.Restricted.Add(playerId);
+                        if (!data.Restricted.Contains(playerData.ID))
+                            data.Restricted.Add(playerData.ID);
 
                         timer.In(60f, () =>
                         {
-                            duelsData.Restricted.Remove(playerId);
+                            data.Restricted.Remove(playerData.ID);
 
-                            if (dataRequests.ContainsKey(playerId))
+                            if (dataRequests.Remove(playerData))
                             {
                                 if (player != null && !IsDueling(player))
-                                    Message(player, msg("RequestTimedOut", playerId, targetName));
-
-                                dataRequests.Remove(playerId);
+                                    Message(user, "RequestTimedOut", targetData.Name);
                             }
                         });
 
@@ -4708,27 +5003,677 @@ namespace Oxide.Plugins
             } // end switch
         }
 
-        public DuelingZone GetPlayerZone(BasePlayer player, int size)
+        public bool GetRequest(string id, out KeyValuePair<PlayerData, PlayerData> request) { foreach (var pair in dataRequests) { if (pair.Key.ID == id || pair.Value.ID == id) { request = pair; return true; } } request = default; return false; }
+        public bool HasRequest(string id) { foreach (var pair in dataRequests) { if (pair.Key.ID == id || pair.Value.ID == id) { return true; } } return false; }
+        public bool GetInitiatedRequest(string id, out KeyValuePair<PlayerData, PlayerData> request) { foreach (var pair in dataRequests) { if (pair.Key.ID == id) { request = pair; return true; } } request = default; return false; }
+        public bool GetPendingRequest(string id, out KeyValuePair<PlayerData, PlayerData> request) { foreach (var pair in dataRequests) { if (pair.Value.ID == id) { request = pair; return true; } } request = default; return false; }
+        public bool HasPendingRequest(string id) { foreach (var pair in dataRequests) { if (pair.Value.ID == id) { return true; } } return false; }
+
+        private static bool IsZoneEmpty(DuelingZone z, int min) => z != null && !z.IsFinito && z.TotalPlayers == 0 && !z.IsLocked && z.Spawns.Count >= min;
+
+        private static bool IsZoneAvailable(DuelingZone z, int min, int max) => z != null && !z.IsFinito && !z.IsFull && !z.IsLocked && z.Spawns.Count >= min && z.Spawns.Count <= max;
+
+        private static bool IsNull(BaseNetworkable a) => a == null || a.IsDestroyed;
+
+        private static bool IsConnected(BasePlayer a) => !IsNotConnected(a);
+
+        private static bool IsNotConnected(BasePlayer a)
         {
-            if (playerZones.Remove(player.UserIDString, out var z))
+            if (a == null || a.IsDestroyed) return true;
+            if (a is DuelistNPC) return false;
+            return !a.IsConnected;
+        }
+
+        private void SafelyHeal(BaseCombatEntity entity)
+        {
+            entity.Invoke(() =>
             {
-                var kvp = duelsData.Zones.FirstOrDefault(entry => entry.Value.name.Equals(z, StringComparison.OrdinalIgnoreCase));
-
-                if (!string.IsNullOrEmpty(kvp.Key))
+                if (entity != null && !entity.IsDestroyed)
                 {
-                    var zone = duelingZones.FirstOrDefault(x => x.Position.ToString() == kvp.Key);
+                    entity.Heal(entity.MaxHealth());
+                }
+            }, 0.1f);
+        }
 
-                    if (size > 2)
-                        return zone == null || zone.IsLocked || zone.Spawns.Count < (requireTeamSize ? size * 2 : 2) ? null : zone;
+        public void CancelDamage(HitInfo hitInfo)
+        {
+            if (hitInfo != null && hitInfo.damageTypes != null)
+            {
+                hitInfo.damageTypes.Clear();
+                hitInfo.DidHit = false;
+                hitInfo.DoHitEffects = false;
+            }
+        }
 
-                    return zone == null || zone.IsLocked || zone.Spawns.Count < requiredMinSpawns || zone.Spawns.Count > requiredMaxSpawns ? null : zone;
+        private void DestroyAll()
+        {
+            using var zones = GetPooledList(duelingZones);
+            foreach (var zone in zones)
+            {
+                UnityEngine.Object.Destroy(zone.gameObject);
+            }
+        }
+
+        private void InitializeDefinitions()
+        {
+            foreach (var def in ItemManager.GetItemDefinitions())
+            {
+                if (def.TryGetComponent(out ItemModDeployable mod))
+                {
+                    _deployables[mod.entityPrefab.resourcePath] = def;
+                }
+            }
+        }
+        public void SaveData()
+        {
+            if (data != null)
+            {
+                Interface.Oxide.DataFileSystem.WriteObject(Name, data);
+            }
+        }
+
+        private void TryAddDisconnect(string uid)
+        {
+            if (_disconnected.Contains(uid))
+            {
+                return;
+            }
+            if (_trackers.Remove(uid, out var obj))
+            {
+                obj.DestroyMe();
+            }
+            _disconnected.Add(uid);
+            timer.Once(60f, () => _disconnected.Remove(uid));
+        }
+
+        private void TryAddSuicide(string uid)
+        {
+            if (!_suicide.Contains(uid))
+            {
+                _suicide.Add(uid);
+                timer.Once(60f, () => _suicide.Remove(uid));
+            }
+        }
+
+        public void SetEscapedEventTracker(BasePlayer player, bool enable, bool duel)
+        {
+            if (enable && !_trackers.TryGetValue(player.UserIDString, out var tracker))
+            {
+                tracker = player.gameObject.AddComponent<EscapedEventTracker>();
+                tracker.Init(player, this, duel);
+                _trackers[player.UserIDString] = tracker;
+            }
+            else if (!enable && _trackers.Remove(player.UserIDString, out tracker))
+            {
+                UnityEngine.Object.Destroy(tracker);
+            }
+        }
+
+        private bool IsBlocked(string uid) => _suicide.Contains(uid) || _disconnected.Contains(uid);
+
+        private bool IsExploiting(BasePlayer player, bool duel)
+        {
+            if (player is DuelistNPC)
+            {
+                return false;
+            }
+
+            if (AimTrain.CanCall() && Convert.ToBoolean(AimTrain?.Call("IsAimTraining", (ulong)player.userID)))
+            {
+                AimTrain?.Call("LeaveAimTrain", player);
+                DestroyUI(player);
+
+                if (duel)
+                {
+                    OnDuelistLost(player, true, false);
+                    RemoveDuelist(player.UserIDString);
+                    ResetDuelist(player.UserIDString, false);
+                    EndSpectate(player);
+                    SendHome(player);
+                }
+                else if (GetDeathmatch(player, out var match))
+                {
+                    if (!match.IsStarted && match.EitherEmpty)
+                    {
+                        match.End();
+                    }
+
+                    if (match.IsStarted && !match.IsOver)
+                    {
+                        DefeatMessage(player, match);
+                        match.RoundsLeft.Remove(player.UserIDString);
+                        match.CanRematch = false;
+                        match.RemoveMatchPlayer(player);
+                    }
+                }
+
+                return true;
+            }
+
+            return false;
+        }
+
+        public void SubscribeHooks(bool flag) // we're using lots of temporary and permanent hooks so we'll turn off the temporary hooks when the plugin is loaded, and unsubscribe to others inside of their hooks when they're no longer in use
+        {
+            if (!flag)
+            {
+                Unsubscribe(nameof(OnPlayerDisconnected));
+                Unsubscribe(nameof(CanNetworkTo));
+                Unsubscribe(nameof(OnItemDropped));
+                Unsubscribe(nameof(OnPlayerSleepEnded));
+                Unsubscribe(nameof(CanCreateWorldProjectile));
+                Unsubscribe(nameof(CanLootEntity));
+                Unsubscribe(nameof(OnPlayerRespawned));
+                Unsubscribe(nameof(OnEntityTakeDamage));
+                Unsubscribe(nameof(OnEntitySpawned));
+                Unsubscribe(nameof(CanBuild));
+                Unsubscribe(nameof(OnPlayerHealthChange));
+                Unsubscribe(nameof(OnEntityDeath));
+                Unsubscribe(nameof(OnEntityKill));
+                //Unsubscribe(nameof(OnPlayerCommand));
+                Unsubscribe(nameof(OnPlayerConnected));
+                Unsubscribe(nameof(OnRestoreUponDeath));
+                Unsubscribe(nameof(CanRevivePlayer));
+                Unsubscribe(nameof(OnLifeSupportSavingLife));
+                return;
+            }
+
+            Subscribe(nameof(OnPlayerDisconnected));
+            Subscribe(nameof(OnItemDropped));
+            Subscribe(nameof(OnPlayerSleepEnded));
+            Subscribe(nameof(CanCreateWorldProjectile));
+            Subscribe(nameof(CanLootEntity));
+            Subscribe(nameof(OnEntitySpawned));
+            Subscribe(nameof(OnRestoreUponDeath));
+            Subscribe(nameof(CanRevivePlayer));
+            Subscribe(nameof(OnLifeSupportSavingLife));
+
+            if (!allowPlayerDeaths)
+                Subscribe(nameof(OnPlayerHealthChange));
+
+            Subscribe(nameof(OnEntityTakeDamage));
+            Subscribe(nameof(OnEntityDeath));
+
+            if (useBlacklistCommands || useWhitelistCommands)
+                Subscribe(nameof(OnPlayerCommand));
+
+            if (respawnWalls)
+                Subscribe(nameof(OnEntityKill));
+        }
+
+        private void FillDeathmatchNpcQueue(BasePlayer player)
+        {
+            DuelingZone zone = duelingZones.Find(x => IsZoneAvailable(x, 1, 999));
+            if (zone == null)
+            {
+                player.ChatMessage("No zone found");
+                return;
+            }
+
+            var target = SpawnNpc(player.transform.position);
+            if (target == null)
+            {
+                player.ChatMessage("Target failed to spawn");
+                return;
+            }
+
+            zone.npcs.Add(target);
+            var match = SetupTeams(player, target);
+            if (match == null)
+            {
+                player.ChatMessage("No match found");
+                return;
+            }
+
+            match.TeamSize = maxDeathmatchSize;
+            Vector3 pos = zone.Location;
+
+            for (int i = 0; i < (match.TeamSize * 2) - 2; i++)
+            {
+                var npc = SpawnNpc(pos);
+                if (npc == null)
+                {
+                    continue;
+                }
+
+                zone.npcs.Add(target);
+                if (!match.IsFull(Team.Good))
+                {
+                    match.AddMatchPlayer(npc, Team.Good);
+                    continue;
+                }
+
+                if (!match.IsFull(Team.Evil))
+                {
+                    match.AddMatchPlayer(npc, Team.Evil);
+                    continue;
+                }
+
+                ulong userid = npc.userID;
+                BasePlayer.bots.Remove(npc);
+                npc.DelayedSafeKill();
+                BasePlayer.freeBotIds.Remove(userid);
+            }
+        }
+
+        private static ulong BotIdCounter = 554922525;
+
+        private DuelistNPC SpawnNpc(Vector3 pos)
+        {
+            if (!InstantiateEntity(new(), pos, true, out var brain, out var npc))
+            {
+                return null;
+            }
+
+            ulong userid = BotIdCounter++;
+
+            npc.userID = userid;
+            npc.UserIDString = userid.ToString();
+            brain.displayName = RandomUsernames.Get(userid);
+            npc.displayName = npc.DisplayNameOverride = brain.displayName;
+
+            npc.loadouts = Array.Empty<PlayerInventoryProperties>();
+            npc.Spawn();
+            npc.CancelInvoke(npc.EquipTest);
+            BasePlayer.bots.Remove(npc);
+
+            return npc;
+        }
+
+        private bool InstantiateEntity(List<Vector3> wander, Vector3 position, bool isStationary, out DuelistBrain brain, out DuelistNPC npc)
+        {
+            static void CopySerializableFields<T>(T src, T dst)
+            {
+                var srcFields = typeof(T).GetFields();
+                foreach (var field in srcFields)
+                {
+                    if (field.IsStatic) continue;
+                    object value = field.GetValue(src);
+                    field.SetValue(dst, value);
                 }
             }
 
-            return null;
+            var prefabName = "assets/rust.ai/agents/npcplayer/humannpc/scientist/scientistnpc_heavy.prefab";
+            var prefab = GameManager.server.FindPrefab(prefabName);
+            var go = Facepunch.Instantiate.GameObject(prefab, position, Quaternion.identity);
+
+            go.SetActive(false);
+
+            go.name = prefabName;
+
+            ScientistBrain scientistBrain = go.GetComponent<ScientistBrain>();
+            ScientistNPC scientistNpc = go.GetComponent<ScientistNPC>();
+
+            npc = go.AddComponent<DuelistNPC>();
+            brain = go.AddComponent<DuelistBrain>();
+            brain.Instance = this;
+            brain._baseEntity = npc;
+            brain.npc = npc;
+            brain.states ??= new();
+            npc.Brain = brain;
+
+            CopySerializableFields(scientistNpc, npc);
+            UnityEngine.Object.DestroyImmediate(scientistBrain, true);
+            UnityEngine.Object.DestroyImmediate(scientistNpc, true);
+            UnityEngine.SceneManagement.SceneManager.MoveGameObjectToScene(go, Rust.Server.EntityScene);
+
+            go.SetActive(true);
+
+            return npc != null;
         }
 
-        private List<ulong> _times = new();
+        private void OnDuelistLost(BasePlayer victim, bool sendHome, bool ready)
+        {
+            RemoveEntities(victim.userID);
+            string vicId = victim.UserIDString;
+            bool isVicNpc = victim is NPCPlayer;
+
+            if (!_duelists.TryGetValue(vicId, out var attack))
+            {
+                NextTick(() => SendHome(victim));
+                return;
+            }
+
+            BasePlayer attacker = attack.GetPlayer();
+            string atkName = attack.Name;
+            string atkId = attack.ID;
+            bool isAtk = attacker != null;
+            bool isAtkNpc = isAtk && attacker is NPCPlayer;
+            double atkHealth = isAtk ? Math.Round(attacker.health, 2) : 0;
+
+            dataDeath.Remove(vicId); // remove them from automatic deaths
+            dataDeath.Remove(atkId);
+            _duelists.Remove(vicId); // unset their status as duelers
+            _duelists.Remove(atkId);
+            victim.inventory.Strip();
+            Metabolize(victim, false);
+            SetEscapedEventTracker(victim, false, true);
+
+            data.TotalDuels++;
+            data.Add(vicId, Points.Loss);
+            data.Add(atkId, Points.Victory);
+            int vicLossesSeed = data.Add(vicId, Points.LossSeed);
+            int atkLossesSeed = data.Get(atkId, Points.LossSeed);
+            int vicVictoriesSeed = data.Get(vicId, Points.VictorySeed);
+            int atkVictoriesSeed = data.Add(atkId, Points.VictorySeed);
+            BetInfo bet = !isVicNpc && !isAtkNpc && data.Bets.TryGetValue(atkId, out var v3) && data.Bets.TryGetValue(vicId, out var v4) && v3.Equals(v4) && !IsAllied(victim, attacker) ? v3 : null; // victim bet his attacker and lost, use later to add a claim for the attacker
+
+            Puts(RemoveFormatting(msg("DuelDeathMessage", null, atkName, atkVictoriesSeed, atkLossesSeed, victim.displayName, vicVictoriesSeed, vicLossesSeed, atkHealth, GetBetWon(bet)))); // send message to console
+            Interface.CallHook("OnDuelistDefeated", attacker, victim);
+
+            if (guiAnnounceUITime > 0f)
+            {
+                if (sendDefeatedHome)
+                {
+                    announcements[vicId] = msg("DuelDeathMessage", vicId, atkName, atkVictoriesSeed, atkLossesSeed, victim.displayName, vicVictoriesSeed, vicLossesSeed, atkHealth, GetBetWon(bet, vicId));
+                    announcements[atkId] = msg("DuelDeathMessage", atkId, atkName, atkVictoriesSeed, atkLossesSeed, victim.displayName, vicVictoriesSeed, vicLossesSeed, atkHealth, GetBetWon(bet, atkId));
+                }
+                else
+                {
+                    CreateAnnouncementUI(victim, msg("DuelDeathMessage", vicId, atkName, atkVictoriesSeed, atkLossesSeed, victim.displayName, vicVictoriesSeed, vicLossesSeed, atkHealth, GetBetWon(bet, vicId)));
+                    CreateAnnouncementUI(attacker, msg("DuelDeathMessage", atkId, atkName, atkVictoriesSeed, atkLossesSeed, victim.displayName, vicVictoriesSeed, vicLossesSeed, atkHealth, GetBetWon(bet, atkId)));
+                }
+            }
+
+            using var targets = GetPlayerList();
+            foreach (var target in targets)
+            {
+                if (target != victim && target != attacker && data.Chat.Contains(target.UserIDString))
+                    continue;
+
+                if (!broadcastDefeat && target != victim && target != attacker && !data.ChatEx.Contains(target.UserIDString))
+                    continue;
+
+                Message(target, "DuelDeathMessage", atkName, atkVictoriesSeed, atkLossesSeed, victim.displayName, vicVictoriesSeed, vicLossesSeed, atkHealth, GetBetWon(bet, target.UserIDString));
+            }
+
+            if (isAtk && bet != null) // award the bet to the attacker
+            {
+                if (!data.ClaimBets.TryGetValue(atkId, out var bets))
+                    data.ClaimBets.Add(atkId, bets = new());
+
+                bets.Add(new(bet.amount * 2, bet.trigger, 0, bet.itemid));
+                data.Bets.Remove(atkId);
+                data.Bets.Remove(vicId);
+                Puts(msg("ConsoleBetWon", null, attacker.displayName, attacker.UserIDString, victim.displayName, vicId));
+                Message(attacker, "NotifyBetWon", szDuelChatCommand);
+            }
+
+            ulong atkIdU = Convert.ToUInt64(atkId);
+            var atkZone = RemoveDuelist(atkId);
+            RemoveEntities(atkIdU);
+            AwardPlayer(atkId, economicsMoney, serverRewardsPoints);
+
+            Interface.Oxide.CallHook("DisableBypass", (ulong)victim.userID);
+            Interface.Oxide.CallHook("DisableBypass", atkIdU);
+
+            if (isAtk)
+            {
+                attacker.inventory.Strip();
+                Metabolize(attacker, false);
+                SetEscapedEventTracker(attacker, false, true);
+            }
+
+            var vicZone = RemoveDuelist(vicId);
+            atkZone ??= vicZone;
+            TryRelocateZone(atkZone);
+
+            if (!AnyParticipants())
+                Unsubscribe(nameof(OnPlayerHealthChange));
+
+            bool isBlocked = IsBlocked(vicId);
+            if (sendHome || isBlocked)
+            {
+                NextTick(() =>
+                {
+                    SendHome(attacker);
+                    SendHome(victim);
+                });
+
+                if (isBlocked)
+                    return;
+            }
+
+            if (attacker != null && ready)
+            {
+                if (victim.IsConnected && attacker.IsConnected)
+                {
+                    var rematch = new Rematch(this);
+                    rematches.Add(rematch);
+                    rematch.Duelists.Add(attacker);
+                    rematch.Duelists.Add(victim);
+                    rematch.ReadyCheck();
+                }
+
+                if (!sendHome && !IsParticipant(attacker) && !IsParticipant(victim))
+                {
+                    StartSpectate(attacker);
+                    StartSpectate(victim);
+                }
+            }
+        }
+
+        private void TryRelocateZone(DuelingZone zone) // TODO: needs to be a coroutine
+        {
+            // nothing to do if we don’t have a zone, no counter set, or it’s already finished
+            if (zone == null || zoneCounter <= 0 || zone.IsFinito)
+                return;
+
+            // count this duel; bail if we haven’t hit the threshold yet
+            if (++zone.Kills < zoneCounter)
+                return;
+
+            // mark this zone as done
+            zone.IsFinito = true;
+
+            // only relocate when it’s empty
+            if (zone.TotalPlayers > 0)
+                return;
+
+            // x amount of duels completed. time to relocate and start all over! changing the dueling zones location keeps things mixed up and entertaining for everyone. especially to shift terrain advantages
+            RemoveDuelZone(zone);
+            SetupDuelZone(GetZoneName(null, zoneRadius));
+            SaveData();
+        }
+
+        private void DefeatMessage(BasePlayer victim, GoodVersusEvilMatch match)
+        {
+            if (tdmAttackers.Remove(victim.UserIDString, out var info))
+            {
+                if (tdmServerDeaths || data.ChatEx.Count > 0)
+                {
+                    using var targets = GetPlayerList();
+                    foreach (var target in targets)
+                    {
+                        if (data.Chat.Contains(target.UserIDString) && target != victim)
+                            continue;
+
+                        //Message(target, GetMatchDefeatMessage(victim, info));
+                        Message(target, GetMatchDeathMessage(target, victim, info, match.TeamSize));
+                    }
+                }
+                else if (tdmMatchDeaths)
+                {
+                    using var targets = match.GetAllPlayers();
+                    foreach (var target in targets)
+                    {
+                        if (data.Chat.Contains(target.UserIDString) && target != victim)
+                            continue;
+
+                        //Message(target, GetMatchDefeatMessage(victim, info));
+                        Message(target, GetMatchDeathMessage(target, victim, info, match.TeamSize));
+                    }
+                }
+
+                if (guiAnnounceUITime > 0f)
+                {
+                    if (match.SendDefeatedHome(victim.UserIDString))
+                    {
+                        //announcements[victim.UserIDString] = GetMatchDefeatMessage(victim, info);
+                        announcements[victim.UserIDString] = GetMatchDeathMessage(victim, victim, info, match.TeamSize);
+                    }
+                    else
+                    {
+                        //CreateAnnouncementUI(victim, GetMatchDefeatMessage(victim, info));
+                        CreateAnnouncementUI(victim, GetMatchDeathMessage(victim, victim, info, match.TeamSize));
+                    }
+                }
+
+                UpdateMatchStats(victim.UserIDString, Points.MatchDeath);
+                UpdateMatchStats(info.AttackerId, Points.MatchKill);
+            }
+        }
+
+        private static string Abbr(string name)
+        {
+            if (string.IsNullOrEmpty(name)) 
+                return string.Empty;
+            int len = name.Length;
+            char[] buf = new char[len];
+            int pos = 0;
+            for (int i = 0; i < len; i++)
+            {
+                char c = name[i];
+                if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
+                    buf[pos++] = c;
+            }
+            return pos == len ? name : new string(buf, 0, pos);
+        }
+
+        private static string GetWeapon(ItemDefinition def, string defaultValue)
+        {
+            if (def == null)
+            {
+                return Abbr(defaultValue);
+            }
+            return ":" + def.shortname + ":";
+        }
+
+        private string GetMatchDefeatMessage(BasePlayer victim, AttackerInfo info) => 
+            msg("MatchDeathMessage1", victim.UserIDString, info.AttackerName, victim.displayName, GetWeapon(info.def, info.Weapon), info.BoneName, info.Distance);
+        
+        private string GetMatchDeathMessage2(BasePlayer target, BasePlayer victim, AttackerInfo info, int size) => msg("MatchDeathMessage2", target.UserIDString,
+                info.AttackerName, data.Get(info.AttackerId, Points.MatchSizeVictorySeed, size), data.Get(info.AttackerId, Points.MatchSizeLossSeed, size),
+                victim.displayName, data.Get(victim.UserIDString, Points.MatchSizeVictory, size), data.Get(victim.UserIDString, Points.MatchSizeVictory, size), size, GetWeapon(info.def, info.Weapon), info.Distance);
+
+        private string GetMatchDeathMessage(BasePlayer target, BasePlayer victim, AttackerInfo info, int size)
+        {
+            using var sb = DisposableBuilder.Get();
+            return sb.Append(msg("MatchDeathMessage2", target.UserIDString))
+                .Replace("{AttackerName}", info.AttackerName)
+                .Replace("{AttackerWins}", data.Get(info.AttackerId, Points.MatchSizeVictorySeed, size).ToString())
+                .Replace("{AttackerLosses}", data.Get(info.AttackerId, Points.MatchSizeLossSeed, size).ToString())
+                .Replace("{VictimName}", victim.displayName)
+                .Replace("{VictimWins}", data.Get(victim.UserIDString, Points.MatchSizeVictorySeed, size).ToString())
+                .Replace("{VictimLosses}", data.Get(victim.UserIDString, Points.MatchSizeLossSeed, size).ToString())
+                .Replace("{Size}", size.ToString())
+                .Replace("{Weapon}", GetWeapon(info.def, info.Weapon))
+                .Replace("{Distance}", info.Distance).ToString();
+        }
+
+        private string GetBetWon(BetInfo bet, string id = null)
+        {
+            return bet != null ? msg("BetWon", id, bet.trigger, bet.amount) : string.Empty;
+        }
+
+        public DuelZoneInfo GetZoneName(string name, float radius)
+        {
+            if (string.IsNullOrEmpty(name))
+            {
+                name = (data.Zones.Count + 1).ToString();
+            }
+            return new(name, radius);
+        }
+
+        public void SendDuelistsHome()
+        {
+            using var targets = GetPlayerList(true);
+            foreach (var target in targets)
+            {
+                if (data.Homes.ContainsKey(target.UserIDString) && DuelTerritory(target.transform.position))
+                {
+                    target.inventory.Strip();
+                    if (target is DuelistNPC)
+                    {
+                        target.DelayedSafeKill();
+                    }
+                    else SendHome(target);
+                }
+                if (IsDuelist(target.UserIDString))
+                {
+                    ResetDuelist(target.UserIDString);
+                }
+            }
+        }
+
+        public void SendSpectatorsHome()
+        {
+            using var targets = GetPlayerList(true);
+            foreach (var target in targets)
+            {
+                if (IsSpectating(target))
+                {
+                    EndSpectate(target);
+                }
+            }
+        }
+
+        private void StartSpectate(BasePlayer player)
+        {
+            if (IsNotConnected(player))
+                return;
+
+            if (!IsParticipant(player))
+            {
+                SendHome(player);
+                return;
+            }
+
+            if (player is DuelistNPC)
+            {
+                player.inventory.Strip();
+                player.health = 100f;
+                StopBleeding(player);
+                player.StopWounded();
+                Disappear(player);
+                return;
+            }
+
+            if (!player.CanInteract())
+            {
+                if (player.IsDead())
+                {
+                    spectators.Add(player.UserIDString);
+                    player.RespawnAt(player.transform.position, Quaternion.identity);
+                }
+                timer.Once(1f, () => StartSpectate(player));
+                return;
+            }
+
+            spectators.Add(player.UserIDString);
+            Message(player, "BeginSpectating");
+            player.inventory.Strip();
+            player.health = 100f;
+            StopBleeding(player);
+            player.StopWounded();
+            CreateDefeatUI(player);
+            Disappear(player);
+        }
+
+        private void EndSpectate(BasePlayer player)
+        {
+            CuiHelper.DestroyUi(player, "DuelistUI_Defeat");
+            Reappear(player);
+
+            if (spectators.Remove(player.UserIDString))
+            {
+                if (playerHealth > 0f && player.IsAlive())
+                    player.health = playerHealth;
+
+                player.SendNetworkUpdate();
+                Message(player, "EndSpectating");
+            }
+        }
 
         public void SetPlayerTime(BasePlayer player, bool set)
         {
@@ -4748,32 +5693,33 @@ namespace Oxide.Plugins
         {
             foreach (string arg in args)
             {
-                if (duelsData.Zones.Values.Exists(z => z.name.Equals(arg, StringComparison.OrdinalIgnoreCase)))
+                foreach (var z in duelingZones)
                 {
-                    string zoneName = duelsData.Zones.Values.FirstOrDefault(x => x.name.Equals(arg, StringComparison.OrdinalIgnoreCase)).name;
-                    Message(player, msg("ZoneSet", player.UserIDString, zoneName));
-                    playerZones[player.UserIDString] = zoneName;
-                    return true;
+                    if (z.name.Equals(arg, StringComparison.OrdinalIgnoreCase))
+                    {
+                        playerZones[player.UserIDString] = z;
+                        Message(player, "ZoneSet", z.name);
+                        return true;
+                    }
                 }
             }
-
             return false;
         }
 
-        public void SetupTeams(BasePlayer player, BasePlayer target)
+        public GoodVersusEvilMatch SetupTeams(BasePlayer player, BasePlayer target)
         {
             if (!IsNewman(player))
             {
-                Message(player, msg("MustBeNaked", player.UserIDString));
-                Message(target, msg("DuelMustBeNaked", target.UserIDString, player.displayName));
-                return;
+                Message(player, "MustBeNaked");
+                Message(target, "DuelMustBeNaked", player.displayName);
+                return null;
             }
 
             if (!IsNewman(target))
             {
-                Message(target, msg("MustBeNaked", target.UserIDString));
-                Message(player, msg("DuelMustBeNaked", player.UserIDString, target.displayName));
-                return;
+                Message(target, "MustBeNaked");
+                Message(player, "DuelMustBeNaked", target.displayName);
+                return null;
             }
 
             RemoveFromQueue(player.UserIDString);
@@ -4783,22 +5729,98 @@ namespace Oxide.Plugins
             match.Setup(player, target);
 
             SubscribeHooks(true);
+            return match;
+        }
+
+        public void CheckAutoReady(BasePlayer player)
+        {
+            if (autoReady || data.AutoReady.Contains(player.UserIDString))
+            {
+                if (!readyUiList.Contains(player.UserIDString))
+                {
+                    ToggleReadyUI(player);
+                }
+            }
+            else if (readyUiList.Contains(player.UserIDString))
+            {
+                CuiHelper.DestroyUi(player, "DuelistUI_Ready");
+                readyUiList.Remove(player.UserIDString);
+            }
+        }
+
+        public void ToggleAutoReady(BasePlayer player)
+        {
+            if (player == null)
+                return;
+
+            if (!autoReady)
+            {
+                if (!data.AutoReady.Remove(player.UserIDString))
+                    data.AutoReady.Add(player.UserIDString);
+
+                Message(player, data.AutoReady.Contains(player.UserIDString) ? "RematchAutoOn" : "RematchAutoOff");
+            }
+
+            if (DuelTerritory(player.transform.position))
+                CreateDefeatUI(player);
+
+            if (duelistUI.Contains(player.UserIDString))
+                RefreshUI(player);
+        }
+
+        public void ReadyUp(BasePlayer player)
+        {
+            if (player == null)
+                return;
+
+            Rematch rematch = null;
+            foreach (var x in rematches)
+            {
+                if (x.HasPlayer(player))
+                {
+                    rematch = x;
+                    break;
+                }
+            }
+
+            if (rematch == null)
+            {
+                ToggleAutoReady(player);
+                //if (IsSpectating(player)) Message(player, "RematchNone");
+                return;
+            }
+
+            if (rematch.Ready.Contains(player))
+            {
+                Message(player, "RematchAcceptedAlready");
+                ToggleAutoReady(player);
+            }
+            else
+            {
+                Message(player, "RematchAccepted");
+                rematch.Ready.Add(player);
+            }
+
+            if (rematch.IsReady())
+            {
+                rematch.Start();
+                rematches.Remove(rematch);
+            }
         }
 
         private void ResetTemporaryData() // keep our datafile cleaned up by removing entries which are temporary
         {
-            if (duelsData == null)
-                duelsData = new();
+            if (data == null)
+                data = new();
 
-            dataDuelists.Clear();
+            _duelists.Clear();
             dataRequests.Clear();
-            dataImmunity.Clear();
-            dataImmunitySpawns.Clear();
-            duelsData.Restricted.Clear();
+            _immune.Clear();
+            data.Restricted.Clear();
             dataDeath.Clear();
-            duelsData.Queued.Clear();
-            duelsData.Homes.Clear();
-            duelsData.Kits.Clear();
+            Queued.Clear();
+            data.Homes.Clear();
+            data.Kits.Clear();
             SaveData();
         }
 
@@ -4816,18 +5838,28 @@ namespace Oxide.Plugins
             return null;
         }
 
+        public static void HolsterWeapon(BasePlayer player)
+        {
+            //HeldEntity heldEntity = player.GetHeldEntity();
+            //if (heldEntity != null)
+            //{
+            //    heldEntity.SetHeld(true);
+            //}
+        }
+
         public void ResetDuelist(string targetId, bool removeHome = true) // remove a dueler from the datafile
         {
-            duelsData.Kits.Remove(targetId);
-            duelsData.Restricted.Remove(targetId);
-            dataImmunity.Remove(targetId);
-            dataImmunitySpawns.Remove(targetId);
-            dataDuelists.Remove(targetId);
-            dataRequests.Remove(targetId);
+            data.Kits.Remove(targetId);
+            data.Restricted.Remove(targetId);
+            _immune.Remove(targetId);
+            _duelists.Remove(targetId);
             dataDeath.Remove(targetId);
 
+            if (GetInitiatedRequest(targetId, out var request))
+                dataRequests.Remove(request.Key);
+
             if (removeHome)
-                duelsData.Homes.Remove(targetId);
+                data.Homes.Remove(targetId);
 
             if (duelingZones.Count > 0)
                 RemoveDuelist(targetId);
@@ -4837,101 +5869,95 @@ namespace Oxide.Plugins
 
         private void RemoveZeroStats() // someone enabled duels but never joined one. remove them to keep the datafile cleaned up
         {
-            using var allowed = GetPool(duelsData.Allowed);
-            foreach (string targetId in allowed)
+            data.Allowed.RemoveAll(targetId =>
             {
-                if (!duelsData.Losses.ContainsKey(targetId) && !duelsData.Victories.ContainsKey(targetId)) // no permanent stats
+                if (data.Get(targetId, Points.Loss) == 0 && data.Get(targetId, Points.Victory) == 0) // no permanent stats
                 {
                     ResetDuelist(targetId);
-                    duelsData.Allowed.Remove(targetId);
+                    return true;
                 }
+                return false;
+            });
+        }
+
+        public void SetupManagedZones()
+        {
+            ManagedZones.Clear();
+
+            if (!ZoneManager.CanCall())
+            {
+                return;
+            }
+
+            timer.Once(30f, SetupManagedZones);
+            config.Zones.Allowed.RemoveAll(string.IsNullOrWhiteSpace);
+
+            if (config.Zones.Allowed.Contains("*"))
+            {
+                return;
+            }
+
+            var zoneIds = ZoneManager?.Call("GetZoneIDs") as string[];
+
+            if (zoneIds == null || zoneIds.Length == 0)
+            {
+                return;
+            }
+
+            foreach (string zoneId in zoneIds)
+            {
+                var obj = ZoneManager?.Call("ZoneFieldList", zoneId);
+                if (obj == null || obj is not Dictionary<string, string> dict)
+                    continue;
+
+                var zoneLoc = dict.TryGetValue("Location", out var loc) ? loc.ToVector3() : Vector3.zero;
+                var radius = dict.TryGetValue("radius", out var rad) ? Convert.ToSingle(rad) : 0f;
+                var size = dict.TryGetValue("size", out var sz) ? sz.ToVector3() : Vector3.zero;
+
+                if (zoneLoc == Vector3.zero || (radius <= 0 && size == Vector3.zero))
+                    continue;
+
+                var zoneName = dict.TryGetValue("name", out var n) ? n : null;
+                var zoneRot = dict.TryGetValue("rotation", out var rot) ? Quaternion.Euler(rot.ToVector3()) : Quaternion.identity;
+                var isBlocked = !config.Zones.Allowed.Exists(zone => zone == zoneId || (!string.IsNullOrEmpty(zoneName) && zoneName.Equals(zone, StringComparison.OrdinalIgnoreCase)));
+                ManagedZones[zoneId] = new(zoneId, zoneLoc, zoneRot, radius, size, isBlocked, zoneRadius);
             }
         }
 
-        public void SetupZoneManager()
+        public void SetupDuelZones()
         {
-            var zoneIds = ZoneManager?.Call("GetZoneIDs");
-
-            if (zoneIds != null && zoneIds is string[])
+            if (data.Zones.Count > zoneAmount) // zoneAmount was changed in the config file so remove existing zones until we're at the new cap
             {
-                foreach (var zoneId in (string[])zoneIds)
-                {
-                    var zoneLoc = ZoneManager?.Call("GetZoneLocation", zoneId);
-
-                    if (zoneLoc is Vector3 && (Vector3)zoneLoc != Vector3.zero)
-                    {
-                        var position = (Vector3)zoneLoc;
-                        var radius = ZoneManager?.Call("GetZoneRadius", zoneId);
-                        float distance = 0f;
-
-                        if (radius is float && (float)radius > 0f)
-                        {
-                            distance = (float)radius;
-                        }
-                        else
-                        {
-                            var zoneSize = ZoneManager?.Call("GetZoneSize", zoneId);
-
-                            if (zoneSize is Vector3 && (Vector3)zoneSize != Vector3.zero)
-                            {
-                                var size = (Vector3)zoneSize;
-                                distance = Mathf.Max(size.x, size.y);
-                            }
-                        }
-
-                        if (distance > 0f)
-                        {
-                            distance += zoneRadius + 5f;
-                            managedZones[position] = distance;
-                        }
-                    }
-                }
-            }
-        }
-
-        public void SetupZones()
-        {
-            if (duelsData.Zones.Count > zoneAmount) // zoneAmount was changed in the config file so remove existing zones until we're at the new cap
-            {
-                int removed = 0;
-
                 do
                 {
-                    var (zoneId, zone) = duelsData.Zones.FirstOrDefault();
-                    var zonePos = zoneId.ToVector3();
+                    var (zonePos, zone) = data.Zones.FirstOrDefault();
 
-                    if (spAutoRemove && duelsData.Spawns.Count > 0)
+                    if (spAutoRemove && data.Spawns.Count > 0)
                     {
-                        using var spawns = GetPool(duelsData.Spawns);
-                        foreach (string spawn in spawns)
-                            if (Vector3.Distance(spawn.ToVector3(), zonePos) <= zone.radius)
-                                duelsData.Spawns.Remove(spawn);
+                        using var spawns = GetPooledList(data.Spawns);
+                        foreach (var spawn in spawns)
+                            if (Vector3.Distance(spawn, zonePos) <= zone.radius)
+                                data.Spawns.Remove(spawn);
                     }
 
-                    duelsData.AutoGeneratedSpawns.Remove(zoneId);
-                    duelsData.Zones.Remove(zoneId);
-                    removed += RemoveZoneWalls(GetOwnerId(zoneId));
-                } while (duelsData.Zones.Count > zoneAmount);
-
-                if (removed > 0)
-                    Puts(msg("RemovedXWallsCustom", null, removed));
+                    data.AutoGeneratedSpawns.Remove(zonePos);
+                    data.Zones.Remove(zonePos);
+                } while (data.Zones.Count > zoneAmount);
             }
 
-            var entities = autoSetup && (duelsData.Zones.Count < zoneAmount || duelsData.Zones.Count > 0) ? GetWallEntities() : null; // don't cache if we don't need to
+            foreach (var entry in data.Zones.ToList()) // create all zones that don't already exist
+                SetupDuelZone(entry.Key, entry.Value);
 
-            foreach (var entry in duelsData.Zones) // create all zones that don't already exist
-                SetupDuelZone(entry.Key.ToVector3(), entities, entry.Value);
-
-            if (autoSetup && duelsData.Zones.Count < zoneAmount) // create each dueling zone that is missing. if this fails then console will be notified
+            if (autoSetup && data.Zones.Count < zoneAmount) // create each dueling zone that is missing. if this fails then console will be notified
             {
                 int attempts = Math.Max(zoneAmount, 5); // 0.1.10 fix - infinite loop fix for when zone radius is too large to fit on the map
                 int created = 0;
 
                 do
                 {
-                    if (SetupDuelZone(entities, GetZoneName(null, zoneRadius)) != Vector3.zero)
+                    if (SetupDuelZone(GetZoneName(null, zoneRadius)) != null)
                         created++;
-                } while (duelsData.Zones.Count < zoneAmount && --attempts > 0);
+                } while (data.Zones.Count < zoneAmount && --attempts > 0);
 
                 if (attempts <= 0)
                 {
@@ -4946,26 +5972,101 @@ namespace Oxide.Plugins
                 Puts(msg("ZonesSetup", null, duelingZones.Count));
         }
 
-        public Vector3 SetupDuelZone(List<BaseEntity> entities, DuelZone zone) // starts the process of creating a new or existing zone and then setting up it's own spawn points around the circumference of the zone
+        public DuelingZone SetupDuelZone(DuelZoneInfo zone) // starts the process of creating a new or existing zone and then setting up it's own spawn points around the circumference of the zone
         {
-            var zonePos = FindDuelingZone(zone.radius); // a complex process to search the map for a suitable area
+            float radius = zone.radius;
+            Vector3 zonePos = Vector3.zero;
+            DateTime tick = DateTime.Now; // create a timestamp to see how long this process takes
+            int maxRetries = 2000; // 0.1.9: increased due to rock collider detection. 0.1.10 rock collider detection removed but amount not changed. 1.3.6 rewrite to cache beforehand
+            int retries = maxRetries; // servers with high entity counts will require this
+
+            if (ManagedZones.Count == 0 && ZoneManager.CanCall())
+                SetupManagedZones();
+
+            do
+            {
+                var currentPos = RandomDropPosition();
+
+                if (currentPos == Vector3.zero)
+                    continue;
+
+                if (DuelTerritory(currentPos, radius + 15f)) // check if position overlaps an existing zone
+                {
+                    _gridPositions.Remove(currentPos);
+                    continue; // overlaps, retry.
+                }
+
+                if (IsManagedZone(currentPos))
+                    continue;
+
+                using var positions = GetCircumferencePositions(currentPos, radius - 15f, 1f, 0f); // gather positions around the proposed zone
+                float min = 200f;
+                float max = -200f;
+                int water = 0;
+
+                foreach (var pos in positions)
+                {
+                    if (Physics.Raycast(new Vector3(pos.x, pos.y + 100f, pos.z), Vector3.down, 500f, Layers.Mask.Water)) //look for water
+                        water++; // count the amount of water colliders
+
+                    min = Mathf.Min(pos.y, min); // set the lowest and highest points of the terrain
+                    max = Mathf.Max(pos.y, max);
+                }
+
+                if (max - min > maxIncline || currentPos.y - min > maxIncline) // the incline is too steep to be suitable for a dueling zone, retry.
+                {
+                    _gridPositions.Remove(currentPos);
+                    continue;
+                }
+
+                if (water > positions.Count / 4) // too much water, retry.
+                {
+                    _gridPositions.Remove(currentPos);
+                    continue;
+                }
+
+                using var entities = GetPooledList<BaseEntity>();
+                Vis.Entities(currentPos, radius + 100f, entities, blockedMask, QueryTriggerInteraction.Ignore); // get all entities using the provided layermask
+                entities.RemoveAll(x => x.IsNpc || x is NPCPlayer || x is BaseOven || x is SleepingBag || x is IceFence || x is SimpleBuildingBlock || x.OwnerID == 0 && x is not BasePlayer);
+
+                if (entities.Count > 0) // if any entities were found from the blockedMask then we don't want this as our dueling zone. retry.
+                {
+                    _gridPositions.Remove(currentPos);
+                    continue;
+                }
+
+                positions.Clear();
+
+                if (currentPos != Vector3.zero)
+                    zonePos = currentPos;
+            } while (zonePos == Vector3.zero && --retries > 0); // prevent infinite loops
+
+            if (zonePos != Vector3.zero)
+            {
+                int tries = maxRetries - retries + 1;
+                string foundZone = msg("FoundZone", null, tries, (DateTime.Now - tick).TotalMilliseconds);
+                Puts(tries == 1 ? foundZone.Replace("tries", "try") : foundZone); // we found a dueling zone! return the position to be assigned, spawn the zone and the spawn points!
+            }
 
             if (zonePos == Vector3.zero) // unfortunately we weren't able to find a location. this is likely due to an extremely high entity count. just try again.
-                return Vector3.zero;
+                return null;
 
-            SetupDuelZone(zonePos, entities, zone);
-            return zonePos;
+            return SetupDuelZone(zonePos, zone);
         }
 
-        public DuelingZone SetupDuelZone(Vector3 zonePos, List<BaseEntity> entities, DuelZone zone)
+        public DuelingZone SetupDuelZone(Vector3 zonePos, DuelZoneInfo zone)
         {
-            if (!duelsData.Zones.ContainsKey(zonePos.ToString()))
-                duelsData.Zones.Add(zonePos.ToString(), zone);
+            zonePos = zonePos.SnapTo(0.001f);
+            if (!data.Zones.ContainsKey(zonePos))
+                data.Zones[zonePos] = zone;
 
             var go = new GameObject();
             var newZone = go.AddComponent<DuelingZone>();
+            newZone.zoneName = zone.name;
+            newZone.env = this;
             newZone.go = go;
             newZone.ProtectionRadius = Mathf.Clamp(zone.radius, 50f, 300f);
+            newZone.SqrProtectionRadius = newZone.ProtectionRadius * newZone.ProtectionRadius;
             newZone.Setup(zonePos);
             duelingZones.Add(newZone);
 
@@ -4977,144 +6078,14 @@ namespace Oxide.Plugins
                 Subscribe(nameof(CanBuild));
             }
 
-            CreateZoneWalls(newZone.Position, zone.radius, zoneUseWoodenWalls ? hewwPrefab : heswPrefab, entities);
+            newZone.CreateZoneWalls(newZone.Location, zone.radius - 5f, zoneUseWoodenWalls ? hewwPrefab : heswPrefab);
             return newZone;
-        }
-
-        private void OnEntitySpawned(SimpleBuildingBlock sbb)
-        {
-            if (sbb != null && sbb.ShortPrefabName.Contains("wall.external.high"))
-            {
-                if (sbb.OwnerID > 0 && !sbb.OwnerID.IsSteamId())
-                {
-                    zoneWallEntities.Add(sbb);
-                }
-            }
-        }
-
-        private List<BaseEntity> zoneWallEntities = new();
-
-        public List<BaseEntity> GetWallEntities()
-        {
-            if (zoneWallEntities.Count == 0)
-            {
-                foreach (var e in BaseNetworkable.serverEntities)
-                {
-                    if (e != null && e.ShortPrefabName.Contains("wall.external.high"))
-                    {
-                        var entity = e as BaseEntity;
-
-                        if (entity != null)
-                        {
-                            zoneWallEntities.Add(entity);
-                        }
-                    }
-                }
-            }
-            zoneWallEntities.RemoveAll(x => x == null || x.IsDestroyed);
-            return zoneWallEntities;
-        }
-
-        public int RemoveZoneWalls(ulong ownerId)
-        {
-            int removed = 0;
-
-            foreach (var entity in GetWallEntities())
-            {
-                if (entity.OwnerID == ownerId)
-                {
-                    entity.Kill();
-                    removed++;
-                }
-            }
-
-            return removed;
-        }
-
-        public bool ZoneWallsExist(ulong ownerId, List<BaseEntity> entities)
-        {
-            if (entities == null || entities.Count < 3)
-                entities = GetWallEntities();
-
-            return entities.Exists(entity => entity.OwnerID == ownerId);
-        }
-
-        public void CreateZoneWalls(Vector3 center, float zoneRadius, string prefab, List<BaseEntity> entities, BasePlayer player = null)
-        {
-            if (!useZoneWalls)
-                return;
-
-            var tick = DateTime.Now;
-            ulong ownerId = GetOwnerId(center.ToString());
-
-            if (ZoneWallsExist(ownerId, entities))
-                return;
-
-            float maxHeight = -200f;
-            float minHeight = 200f;
-            int spawned = 0;
-            int raycasts = Mathf.CeilToInt(360 / zoneRadius * 0.1375f);
-
-            foreach (var position in GetCircumferencePositions(center, zoneRadius, raycasts, 0f)) // get our positions and perform the calculations for the highest and lowest points of terrain
-            {
-                if (Physics.Raycast(new Vector3(position.x, position.y + 200f, position.z), Vector3.down, out var hit, Mathf.Infinity, wallMask))
-                {
-                    maxHeight = Mathf.Max(hit.point.y, maxHeight); // calculate the highest point of terrain
-                    minHeight = Mathf.Min(hit.point.y, minHeight); // calculate the lowest point of terrain
-                    center.y = minHeight; // adjust the spawn point of our walls to that of the lowest point of terrain
-                }
-            }
-
-            float gap = prefab == heswPrefab ? 0.3f : 0.5f; // the distance used so that each wall fits closer to the other so players cannot throw items between the walls
-            int stacks = Mathf.CeilToInt((maxHeight - minHeight) / 6f) + extraWallStacks; // get the amount of walls to stack onto each other to go above the highest point
-            float next = 360 / zoneRadius - gap; // the distance apart each wall will be from the other
-
-            for (int i = 0; i < stacks; i++) // create our loop to spawn each stack
-            {
-                foreach (var position in GetCircumferencePositions(center, zoneRadius, next, center.y)) // get a list positions where each positions difference is the width of a high external stone wall. specify the height since we've already calculated what's required
-                {
-                    float groundHeight = TerrainMeta.HeightMap.GetHeight(new Vector3(position.x, position.y + 6f, position.z));
-
-                    if (groundHeight > position.y + 9f) // 0.1.13 improved distance check underground
-                        continue;
-
-                    if (useLeastAmount && position.y - groundHeight > 6f + extraWallStacks * 6f)
-                        continue;
-
-                    var entity = GameManager.server.CreateEntity(prefab, position, default(Quaternion), false);
-
-                    if (entity != null)
-                    {
-                        entity.OwnerID = ownerId; // set a unique identifier so the walls can be easily removed later
-                        entity.transform.LookAt(center, Vector3.up); // have each wall look at the center of the zone
-                        entity.Spawn(); // spawn into the game
-                        entity.gameObject.SetActive(true); // 0.1.16: fix for animals and explosives passing through walls. set it active after it spawns otherwise AntiHack will throw ProjectileHack: Line of sight warnings each time the entity is hit
-                        spawned++; // our counter
-                    }
-                    else
-                        return; // invalid prefab, return or cause massive server lag
-
-                    if (stacks == i - 1)
-                    {
-                        if (Physics.Raycast(new Vector3(position.x, position.y + 6f, position.z), Vector3.down, out var hit, 12f, worldMask))
-                            stacks++; // 0.1.16 fix where rocks could allow a boost in or out of the top of a zone
-                    }
-                }
-
-                center.y += 6f; // increase the positions height by one high external stone wall's height
-            }
-
-            if (player == null)
-                Puts(msg("GeneratedWalls", null, spawned, stacks, FormatPosition(center), (DateTime.Now - tick).TotalSeconds));
-            else
-                Message(player, msg("GeneratedWalls", player.UserIDString, spawned, stacks, FormatPosition(center), (DateTime.Now - tick).TotalSeconds));
-
-            Subscribe(nameof(OnEntityTakeDamage));
         }
 
         public void EjectPlayers(DuelingZone zone)
         {
-            foreach (var player in zone.Players)
+            using var players = zone.Players;
+            foreach (var player in players)
             {
                 EjectPlayer(player);
             }
@@ -5122,7 +6093,7 @@ namespace Oxide.Plugins
 
         public void EjectPlayer(BasePlayer player)
         {
-            if (IsNull(player))
+            if (IsNull(player) || player is DuelistNPC)
                 return;
 
             player.inventory.Strip();
@@ -5132,9 +6103,11 @@ namespace Oxide.Plugins
 
         public void RemoveDuelZone(DuelingZone zone)
         {
-            string uid = zone.Position.ToString();
+            var uid = zone.Location;
+            foreach (var npc in zone.npcs)
+                npc.SafelyKill();
 
-            using var ids = GetPool(spectators);
+            using var ids = GetPooledList(spectators);
             foreach (string playerId in ids)
             {
                 var player = BasePlayer.Find(playerId);
@@ -5155,16 +6128,19 @@ namespace Oxide.Plugins
             var match = tdmMatches.FirstOrDefault(x => x.Zone != null && x.Zone == zone);
 
             if (match != null)
+            {
+                match.IsOver = true;
                 match.End();
+            }
 
-            if (spAutoRemove && duelsData.Spawns.Count > 0)
+            if (spAutoRemove && data.Spawns.Count > 0)
                 foreach (var spawn in zone.Spawns)
-                    duelsData.Spawns.Remove(spawn.ToString());
+                    data.Spawns.Remove(spawn);
 
-            duelsData.Zones.Remove(uid);
-            duelsData.AutoGeneratedSpawns.Remove(uid);
+            data.Zones.Remove(uid);
+            data.AutoGeneratedSpawns.Remove(uid);
+
             RemoveEntities(zone);
-            RemoveZoneWalls(GetOwnerId(uid));
             zone.Kill();
 
             if (duelingZones.Count == 0 && tdmMatches.Count == 0)
@@ -5174,52 +6150,64 @@ namespace Oxide.Plugins
             }
         }
 
-        public void RemoveEntities(ulong playerId)
+        public void RemoveEntities(ulong userId)
         {
-            if (duelEntities.TryGetValue(playerId, out var ents))
+            if (duelEntities.Remove(userId, out var ents))
             {
-                foreach (var e in ents)
-                    e.SafelyKill();
-
-                duelEntities.Remove(playerId);
+                for (int i = 0, n = ents.Count; i < n; i++)
+                {
+                    ents[i].SafelyKill();
+                }
             }
         }
 
         public void RemoveEntities(DuelingZone zone)
         {
-            using var tmp = GetPool(duelEntities);
-            foreach (var entry in tmp)
+            using var tmp = GetPooledList(duelEntities);
+            foreach (var (userid, entities) in tmp)
             {
-                using var entities = GetPool(entry.Value);
-                foreach (var entity in entities)
+                for (int i = entities.Count - 1; i >= 0; i--)
                 {
-                    if (entity.IsKilled())
+                    var e = entities[i];
+                    if (e.IsKilled())
                     {
-                        entry.Value.Remove(entity);
+                        entities.RemoveAt(i);
                         continue;
                     }
-
-                    if (zone.Distance(entity.transform.position) <= zone.ProtectionRadius + 1f)
+                    var v = e.transform.position - zone.Location;
+                    if (v.sqrMagnitude <= zone.SqrProtectionRadius + 2f)
                     {
-                        entry.Value.Remove(entity);
-                        entity.Kill();
+                        entities.RemoveAt(i);
+                        e.Kill();
                     }
+                }
+                if (entities.Count == 0)
+                {
+                    duelEntities.Remove(userid);
                 }
             }
         }
 
         public DuelingZone GetDuelZone(Vector3 startPos, float offset = 1f)
         {
-            return duelingZones.FirstOrDefault(zone => zone.Distance(startPos) <= zone.ProtectionRadius + offset);
+            offset *= offset;
+            foreach (var zone in duelingZones)
+            {
+                if (zone.SqrDistance(startPos) <= zone.SqrProtectionRadius + offset)
+                {
+                    return zone;
+                }
+            }
+            return null;
         }
 
         public void SendHome(BasePlayer player) // send a player home to the saved location that they joined from
         {
-            if (player != null && duelsData.Homes.TryGetValue(player.UserIDString, out var home))
+            if (player != null && player.IsHuman() && data.Homes.TryGetValue(player.UserIDString, out var homePos))
             {
                 if (player.IsDead() && !player.IsConnected && !respawnDeadDisconnect)
                 {
-                    duelsData.Homes.Remove(player.UserIDString);
+                    data.Homes.Remove(player.UserIDString);
                     return;
                 }
 
@@ -5229,12 +6217,12 @@ namespace Oxide.Plugins
                     return;
                 }
 
+                
                 RemoveEntities(player.userID);
-                var homePos = home.ToVector3();
 
                 if (DuelTerritory(homePos) && !player.IsAdmin)
                 {
-                    using var bags = GetPool(SleepingBag.FindForPlayer(player.userID, true));
+                    using var bags = GetPooledList(SleepingBag.FindForPlayer(player.userID, true));
 
                     if (bags.Count > 0)
                     {
@@ -5267,8 +6255,10 @@ namespace Oxide.Plugins
                 if (playerHealth > 0f)
                     player.health = playerHealth;
 
+                StopBleeding(player);
+                Reappear(player);
                 GiveRespawnLoot(player);
-                duelsData.Homes.Remove(player.UserIDString);
+                data.Homes.Remove(player.UserIDString);
 
                 if (guiAutoEnable || createUI.Contains(player.UserIDString))
                     OnPlayerConnected(player);
@@ -5286,16 +6276,14 @@ namespace Oxide.Plugins
 
                 foreach (var entry in respawnLoot)
                 {
-                    Item item = ItemManager.CreateByName(entry.shortname, entry.amount, entry.skin);
-
-                    if (item == null)
-                        continue;
-
+                    ItemDefinition def = ItemManager.FindItemDefinition(entry.shortname);
+                    if (def == null) continue;
+                    ulong skin = RequiresOwnership(def, entry.skin) ? 0 : entry.skin;
+                    Item item = ItemManager.CreateByName(entry.shortname, entry.amount, skin);
                     var container = entry.container == "wear" ? player.inventory.containerWear : entry.container == "belt" ? player.inventory.containerBelt : player.inventory.containerMain;
-
-                    if (!item.MoveToContainer(container, entry.slot))
+                    if (item != null && !item.MoveToContainer(container, entry.slot) && !player.inventory.GiveItem(item))
                     {
-                        item.Remove(0f);
+                        item.Remove(0.01f);
                     }
                 }
             }
@@ -5313,7 +6301,7 @@ namespace Oxide.Plugins
             {
                 Subscribe(nameof(OnEntitySpawned));
 
-                using var ents = GetPool(BaseNetworkable.serverEntities);
+                using var ents = GetPooledList(BaseNetworkable.serverEntities);
                 foreach (var ent in ents)
                 {
                     var block = ent as BuildingBlock;
@@ -5326,7 +6314,33 @@ namespace Oxide.Plugins
             }
         }
 
-        private void CheckZoneHooks(bool message = false)
+        public void SetupPower(BaseEntity e)
+        {
+            if (e == null || e.IsDestroyed)
+            {
+                return;
+            }
+            else if (autoOvens && e is BaseOven)
+            {
+                e.SetFlag(BaseEntity.Flags.On, true);
+            }
+            else if (autoFlames && e is FlameTurret ft)
+            {
+                if (!ft.HasFuel())
+                {
+                    ft.inventory.AddItem(ItemManager.FindItemDefinition("lowgradefuel"), 5);
+                }
+
+                ft.fuelPerSec = 0f;
+            }
+            else if (autoTurrets && e is AutoTurret at)
+            {
+                at.InitiateStartup();
+                at.SetPeacekeepermode(false);
+            }
+        }
+
+        private void CheckZoneHooks()
         {
             if (respawnWalls && duelingZones.Count > 0)
             {
@@ -5337,54 +6351,49 @@ namespace Oxide.Plugins
 
         private void CheckDuelistMortality()
         {
-            eventTimer = timer.Once(0.5f, CheckDuelistMortality);
-
-            if (dataImmunity.Count > 0) // each player that spawns into a dueling zone is given immunity for X seconds. here we'll keep track of this and remove their immunities
+            if (_immune.Count > 0) // each player that spawns into a dueling zone is given immunity for X seconds. here we'll keep track of this and remove their immunities
             {
-                var timeStamp = TimeStamp();
-
-                using var immunities = GetPool(dataImmunity);
-                foreach (var (userid, then) in immunities)
+                var timeStamp = Time.time;
+                using var immunities = GetPooledList(_immune);
+                foreach (var immune in immunities)
                 {
-                    var player = BasePlayer.Find(userid);
-                    long time = then - timeStamp;
+                    var player = immune.Value.GetPlayer();
+                    var time = immune.Value.Time - timeStamp;
 
                     if (time <= 0)
                     {
-                        dataImmunity.Remove(userid);
-                        dataImmunitySpawns.Remove(userid);
+                        _immune.Remove(immune.Key);
 
                         if (IsNotConnected(player))
                             continue;
 
                         CuiHelper.DestroyUi(player, "DuelistUI_Countdown");
-                        Message(player, msg("ImmunityFaded", player.UserIDString));
+                        Message(player, "ImmunityFaded");
                     }
                     else if (player != null && player.IsConnected)
                     {
-                        if (noMovement && dataImmunitySpawns.TryGetValue(player.UserIDString, out Vector3 dest))
+                        if (noMovement && _immune.TryGetValue(player.UserIDString, out var dest))
                         {
-                            player.Teleport(dest);
+                            player.Teleport(dest.Spawn);
                         }
 
-                        CreateCountdownUI(player, time.ToString());
+                        CreateCountdownUI(player, time);
                     }
                 }
             }
 
             if (dataDeath.Count > 0) // keep track of how long the match has been going on for, and if it's been too long then kill the player off.
             {
-                var timeStamp = TimeStamp();
-
-                using var deaths = GetPool(dataDeath);
-                foreach (var (userid, then) in deaths)
+                var timeStamp = Time.time;
+                using var deaths = GetPooledList(dataDeath);
+                foreach (var death in deaths)
                 {
-                    if (then - timeStamp <= 0)
+                    if (death.Value - timeStamp <= 0)
                     {
-                        var target = BasePlayer.Find(userid);
-                        dataDeath.Remove(userid);
+                        var target = BasePlayer.Find(death.Key);
+                        dataDeath.Remove(death.Key);
 
-                        if (IsNotConnected(target) || (!IsDueling(target) && !InDeathmatch(target)))
+                        if (!InEvent(target))
                             continue;
 
                         target.inventory.Strip();
@@ -5396,121 +6405,247 @@ namespace Oxide.Plugins
             UpdateMatchUI();
         }
 
-        public void SubscribeHooks(bool flag) // we're using lots of temporary and permanent hooks so we'll turn off the temporary hooks when the plugin is loaded, and unsubscribe to others inside of their hooks when they're no longer in use
+        // API & Helper methods
+        private static PooledList<BasePlayer> GetPlayerList(bool sleepers = false)
         {
-            if (!flag)
+            PooledList<BasePlayer> players = GetPooledList<BasePlayer>();
+            foreach (var player in BasePlayer.activePlayerList)
             {
-                Unsubscribe(nameof(OnPlayerDisconnected));
-                //Unsubscribe(nameof(CanNetworkTo));
-                Unsubscribe(nameof(OnItemDropped));
-                Unsubscribe(nameof(OnPlayerSleepEnded));
-                Unsubscribe(nameof(OnCreateWorldProjectile));
-                Unsubscribe(nameof(OnLootEntity));
-                Unsubscribe(nameof(OnPlayerRespawned));
-                Unsubscribe(nameof(OnEntityTakeDamage));
-                Unsubscribe(nameof(OnEntitySpawned));
-                Unsubscribe(nameof(CanBuild));
-                Unsubscribe(nameof(OnPlayerHealthChange));
-                Unsubscribe(nameof(OnEntityDeath));
-                Unsubscribe(nameof(OnEntityKill));
-                //Unsubscribe(nameof(OnPlayerCommand));
-                Unsubscribe(nameof(OnPlayerConnected));
-                Unsubscribe(nameof(OnRestoreUponDeath));
-                return;
+                if (player != null && player.displayName != null)
+                {
+                    players.Add(player);
+                }
             }
-
-            Subscribe(nameof(OnPlayerDisconnected));
-            Subscribe(nameof(OnItemDropped));
-            Subscribe(nameof(OnPlayerSleepEnded));
-            Subscribe(nameof(OnCreateWorldProjectile));
-            Subscribe(nameof(OnLootEntity));
-            Subscribe(nameof(OnEntitySpawned));
-            Subscribe(nameof(OnRestoreUponDeath));
-
-            if (!allowPlayerDeaths)
-                Subscribe(nameof(OnPlayerHealthChange));
-
-            Subscribe(nameof(OnEntityTakeDamage));
-            Subscribe(nameof(OnEntityDeath));
-
-            if (useBlacklistCommands || useWhitelistCommands)
+            if (!sleepers)
             {
-                Subscribe(nameof(OnPlayerCommand));
+                return players;
             }
-
-            if (respawnWalls)
-                Subscribe(nameof(OnEntityKill));
+            foreach (var player in BasePlayer.sleepingPlayerList)
+            {
+                if (player != null && player.displayName != null)
+                {
+                    players.Add(player);
+                }
+            }
+            return players;
         }
 
-        // Helper methods which are essential for the plugin to function. Do not modify these.
+        private float ClosestDistanceSq(Vector3 position)
+        {
+            float closestDistSq = float.MaxValue;
+
+            foreach (var zone in duelingZones)
+            {
+                float distSq = (zone.Location - position).sqrMagnitude;
+                if (distSq < closestDistSq)
+                    closestDistSq = distSq;
+            }
+
+            return closestDistSq;
+        }
+
+        public static bool IsCustomEntity(BaseEntity m) => m.PrefabName.StartsWith("assets/custom/");
+
+        private static float MaxTerrainY = 150f;
+        private static float GetSpawnHeight(Vector3 v, float maxSpawnY)
+        {
+            float y = Mathf.Max(TerrainMeta.HeightMap.GetHeight(v), TerrainMeta.WaterMap.GetHeight(v));
+            MaxTerrainY = Mathf.Max(MaxTerrainY, y);
+            Ray ray = new Ray(new Vector3(v.x, Mathf.Min(MaxTerrainY, maxSpawnY) + 12f, v.z), Vector3.down);
+            if (GamePhysics.Trace(ray, 0f, out RaycastHit hit, Mathf.Infinity, 144802049, QueryTriggerInteraction.Ignore))
+                return Mathf.Max(y, hit.point.y);
+            return y;
+        }
 
         [HookMethod("DuelistTerritory")]
-        public bool DuelistTerritory(Vector3 position) // API
-        {
-            return DuelTerritory(position);
-        }
-
         public bool DuelTerritory(Vector3 position, float offset = 5f) // 0.1.21: arena can be inside of the zone at any height
         {
-            return duelingZones.Exists(zone => Vector3.Distance(zone.Position, position) <= zone.ProtectionRadius + offset);
+            position.y = 0f;
+            offset *= offset;
+            foreach (var zone in duelingZones)
+            {
+                if ((zone.LocationXZ3D - position).sqrMagnitude <= zone.SqrProtectionRadius + offset)
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
-        public ulong GetOwnerId(string uid)
+        private void GetAllPlayersNonAlloc(List<BasePlayer> duelers)
         {
-            return Convert.ToUInt64(Math.Abs(uid.GetHashCode()));
+            foreach (var duelist in _duelists.Values)
+            {
+                if (duelist.Player != null)
+                {
+                    duelers.Add(duelist.Player);
+                }
+            }
+            foreach (var team in tdmMatches)
+            {
+                using var players = team.GetAllPlayers();
+                foreach (var player in players)
+                {
+                    duelers.Add(player);
+                }
+            }
+        }
+
+        private void GetAllPlayersNonAlloc(List<string> duelers)
+        {
+            duelers.AddRange(_duelists.Keys);
+            foreach (var team in tdmMatches)
+            {
+                foreach (var player in team.Good.Players.Keys)
+                {
+                    duelers.Add(player);
+                }
+                foreach (var player in team.Evil.Players.Keys)
+                {
+                    duelers.Add(player);
+                }
+            }
+        }
+
+        private bool GetMatchRequestTarget(BasePlayer sender, out string targetId) => tdmRequests.TryGetValue(sender.UserIDString, out targetId);
+
+        private bool GetMatchRequestSender(BasePlayer recipient, out string senderId)
+        {
+            foreach (var entry in tdmRequests)
+            {
+                if (entry.Value == recipient.UserIDString)
+                {
+                    senderId = entry.Key;
+                    return true;
+                }
+            }
+            senderId = null;
+            return false;
+        }
+
+        private bool HasRequestTarget(BasePlayer sender) => GetMatchRequestTarget(sender, out _);
+
+        private bool HasRequestSender(BasePlayer recipient) => GetMatchRequestSender(recipient, out _);
+
+        private bool ImmunityEnabled() => immunityTime >= 1;
+
+        private bool UserHasImmunity(string userid) => ImmunityEnabled() && _immune.TryGetValue(userid, out var immune) && immune.Time > Time.time;
+
+        public void EnableUserImmunity(BasePlayer player, Vector3 spawn)
+        {
+            if (ImmunityEnabled())
+            {
+                _immune[player.UserIDString] = new(player, Time.time + immunityTime, spawn);
+            }
+        }
+
+        private bool DuelsEnabled(string userid) => autoAllowAll || data.Allowed.Contains(userid);
+
+        private bool AnyParticipants(bool spectator = false)
+        {
+            if (spectator && spectators.Count > 0) return true;
+            return _duelists.Count > 0 || tdmMatches.Count > 0;
+        }
+
+        private bool IsParticipant(BasePlayer player, bool spectator = false)
+        {
+            if (player == null || player.IsDestroyed) return false;
+            return IsParticipant(player.UserIDString, spectator);
+        }
+
+        private bool IsParticipant(string userid, bool spectator = false)
+        {
+            if (spectator && IsSpectator(userid)) return true;
+            return IsDuelist(userid) || IsTeamMember(userid);
+        }
+
+        private bool IsDuelist(string userid)
+        {
+            return _duelists.ContainsKey(userid);
         }
 
         [HookMethod("inEvent")]
-        public bool inEvent(BasePlayer player)
+        private bool InEvent(BasePlayer player, bool spectate = false)
         {
-            return InEvent(player);
+            if (player == null || player.IsDestroyed) return false;
+            if (IsParticipant(player.UserIDString)) return DuelTerritory(player.transform.position);
+            return spectate && IsSpectator(player.UserIDString) && DuelTerritory(player.transform.position);
         }
 
-        public bool InEvent(BasePlayer player)
+        private bool IsDueling(BasePlayer player)
         {
-            return player != null && (dataDuelists.ContainsKey(player.UserIDString) || tdmMatches.Exists(match => match.GetTeam(player) != Team.None));
+            return player != null && !player.IsDestroyed && IsDuelist(player.UserIDString) && DuelTerritory(player.transform.position);
         }
 
-        public bool IsDueling(BasePlayer player)
+        private bool GetDuelist(BasePlayer player, out PlayerData playerData)
         {
-            return player != null && duelsData != null && duelingZones.Count > 0 && player != null && dataDuelists.ContainsKey(player.UserIDString) && DuelTerritory(player.transform.position);
+            playerData = null;
+            return player != null && !player.IsDestroyed && _duelists.TryGetValue(player.UserIDString, out playerData) && DuelTerritory(player.transform.position);
         }
 
-        public bool InDeathmatch(BasePlayer player)
+        private bool InDeathmatch(BasePlayer player)
         {
-            return player != null && tdmMatches.Exists(team => team.GetTeam(player) != Team.None) && DuelTerritory(player.transform.position);
+            return IsTeamMember(player) && DuelTerritory(player.transform.position);
         }
 
-        public bool IsSpectator(BasePlayer player)
+        private bool IsTeamMember(BasePlayer player)
         {
-            return player != null && spectators.Contains(player.UserIDString) && DuelTerritory(player.transform.position);
+            return player != null && !player.IsDestroyed && IsTeamMember(player.UserIDString);
         }
 
-        public bool IsEventBanned(string targetId)
+        private bool IsTeamMember(string userid)
         {
-            return duelsData.Bans.ContainsKey(targetId);
+            foreach (var match in tdmMatches)
+            {
+                if (match.GetTeam(userid) != Team.None)
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
-        public static long TimeStamp() => (DateTime.Now.Ticks - DateTime.Parse("01/01/1970 00:00:00").Ticks) / 10000000;
-
-        public string GetDisplayName(string targetId)
+        public bool GetDeathmatch(BasePlayer player, out GoodVersusEvilMatch match)
         {
-            return covalence.Players.FindPlayerById(targetId)?.Name ?? targetId;
+            match = null;
+            if (player == null || player.IsDestroyed)
+            {
+                return false;
+            }
+            foreach (var m in tdmMatches)
+            {
+                if (m.GetTeam(player) != Team.None)
+                {
+                    match = m;
+                    break;
+                }
+            }
+            return match != null && DuelTerritory(player.transform.position);
+        }
+
+        private bool IsSpectator(BasePlayer player)
+        {
+            return player != null && !player.IsDestroyed && IsSpectator(player.UserIDString);
+        }
+
+        private bool IsSpectator(string userid)
+        {
+            return spectators.Contains(userid);
+        }
+
+        private bool IsSpectating(BasePlayer player)
+        {
+            return IsSpectator(player) && DuelTerritory(player.transform.position);
+        }
+
+        private bool IsEventBanned(string targetId)
+        {
+            return data.Bans.ContainsKey(targetId);
         }
 
         public void Log(string file, string message, bool timestamp = false)
         {
-            LogToFile(file, $"[{DateTime.Now}] {message}", this, timestamp);
-        }
-
-        public GoodVersusEvilMatch GetMatch(BasePlayer player)
-        {
-            return tdmMatches.FirstOrDefault(team => team.GetTeam(player) != Team.None);
-        }
-
-        public bool InMatch(BasePlayer target)
-        {
-            return tdmMatches.Exists(team => team.GetTeam(target) != Team.None);
+            LogToFile(file, message, this, false, timestamp);
         }
 
         public bool IsOnConstruction(Vector3 position)
@@ -5519,7 +6654,7 @@ namespace Oxide.Plugins
             return Physics.Raycast(position, Vector3.down, out var hit, 1.5f, constructionMask) && hit.GetEntity() != null;
         }
 
-        public bool Teleport(BasePlayer player, Vector3 destination)
+        public bool Teleport(BasePlayer player, Vector3 destination, float radius = 0f, bool sleep = true)
         {
             if (player == null || destination == Vector3.zero) // don't send a player to their death. this should never happen
                 return false;
@@ -5528,10 +6663,14 @@ namespace Oxide.Plugins
 
             if (DuelTerritory(destination))
             {
-                var rematch = rematches.FirstOrDefault(x => x.HasPlayer(player));
-
-                if (rematch != null)
-                    rematches.Remove(rematch);
+                foreach (var rematch in rematches)
+                {
+                    if (rematch.HasPlayer(player))
+                    {
+                        rematches.Remove(rematch);
+                        break;
+                    }
+                }
 
                 SetPlayerTime(player, true);
             }
@@ -5539,17 +6678,13 @@ namespace Oxide.Plugins
             if (player.IsWounded())
                 player.StopWounded();
 
-            player.metabolism.bleeding.value = 0;
-
-            if (playerHealth > 0f && player.health < playerHealth)
+            if (playerHealth > 6f)
                 player.health = playerHealth;
 
-            if (player.IsConnected)
+            if (sleep && player.IsConnected)
                 player.StartSleeping();
 
-            player.Teleport(destination);
-
-            if (player.IsConnected && (Vector3.Distance(player.transform.position, destination) > 50f || !DuelTerritory(destination))) // 1.1.2 reduced from 150 to 100
+            if (player.IsConnected && (Vector3.Distance(player.transform.position, destination) > radius * 2f || !DuelTerritory(destination))) // 1.1.2 reduced from 150 to 100
             {
                 player.SetPlayerFlag(BasePlayer.PlayerFlags.ReceivingSnapshot, true);
                 player.ClientRPC(RpcTarget.Player("StartLoading", player), arg1: true);
@@ -5557,14 +6692,26 @@ namespace Oxide.Plugins
                 player.SendEntityUpdate();
             }
 
-            player.SendNetworkUpdateImmediate(false);
+            player.Teleport(destination);
+            player.SendNetworkUpdateImmediate();
+            StopBleeding(player);
 
             if (LustyMap.CanCall())
             {
                 LustyMap?.Call(DuelTerritory(destination) ? "DisableMaps" : "EnableMaps", player);
             }
 
+            if (!sleep && player.IsConnected || player is DuelistNPC)
+                OnPlayerSleepEnded(player);
+
             return true;
+        }
+
+        private static void StopBleeding(BasePlayer player)
+        {
+            player.metabolism.bleeding.value = 0;
+            player.metabolism.isDirty = true;
+            player.metabolism.SendChanges();
         }
 
         public bool IsThrownWeapon(Item item)
@@ -5589,13 +6736,20 @@ namespace Oxide.Plugins
             return false;
         }
 
-        private HashSet<Vector3> _gridPositions = new();
+        private HashSet<Vector3> _gridPositions = new(), _gridPositionsVal = new();
 
         public Vector3 RandomDropPosition()
         {
-            if (_gridPositions.Count < 5000)
+            if (_gridPositions.Count == 0)
             {
                 SetupPositions();
+                _gridPositionsVal.UnionWith(_gridPositions);
+            }
+
+            if (_gridPositions.Count < 1000)
+            {
+                _gridPositions.Clear();
+                _gridPositions.UnionWith(_gridPositionsVal);
             }
 
             return _gridPositions.ElementAt(Random.Range(0, _gridPositions.Count));
@@ -5603,8 +6757,10 @@ namespace Oxide.Plugins
 
         private void SetupPositions()
         {
+            _gridPositions.Clear();
             int minPos = (int)(World.Size / -2f);
             int maxPos = (int)(World.Size / 2f);
+            float maxRadius = config.Zones.zoneRadius;
 
             for (float x = minPos; x < maxPos; x += 15f)
             {
@@ -5612,42 +6768,25 @@ namespace Oxide.Plugins
                 {
                     var pos = new Vector3(x, 0f, z);
 
-                    foreach (var monument in monuments)
-                    {
-                        if (Vector3.Distance(pos, monument) < 150f) // don't put the dueling zone inside of a monument. players will throw a shit fit
-                        {
-                            pos = Vector3.zero;
-                            break;
-                        }
-                    }
-
-                    if (pos == Vector3.zero)
+                    if (IsMonumentPosition(pos))
                         continue;
 
-                    if (managedZones.Count > 0)
-                    {
-                        foreach (var zone in managedZones)
-                        {
-                            if (Vector3.Distance(zone.Key, pos) <= zone.Value)
-                            {
-                                pos = Vector3.zero; // blocked by zone manager
-                                break;
-                            }
-                        }
-                    }
-
-                    if (pos == Vector3.zero)
+                    if (IsManagedZone(pos))
                         continue;
 
                     var y = TerrainMeta.HeightMap.GetHeight(pos);
                     pos.y = y + 100f; // setup the hit
 
                     if (!Physics.Raycast(pos, Vector3.down, out var hit, pos.y, groundMask))
-                    {
                         continue; // found water instead of land
-                    }
 
                     if (WaterLevel.GetOverallWaterDepth(pos, true, true, null) > 0f)
+                        continue;
+
+                    if ((ContainsTopology(TerrainTopology.Enum.Road | TerrainTopology.Enum.Roadside, pos, maxRadius) || HasPointOnPathList(TerrainMeta.Path?.Roads, pos, maxRadius)))
+                        continue;
+
+                    if ((ContainsTopology(TerrainTopology.Enum.Rail | TerrainTopology.Enum.Railside, pos, maxRadius) || HasPointOnPathList(TerrainMeta.Path?.Rails, pos, maxRadius)))
                         continue;
 
                     pos.y = Mathf.Max(hit.point.y, y); // get the max height
@@ -5657,79 +6796,57 @@ namespace Oxide.Plugins
             }
         }
 
-        public Vector3 FindDuelingZone(float radius)
+        private bool IsMonumentPosition(Vector3 pos)
         {
-            Vector3 position = Vector3.zero;
-            DateTime tick = DateTime.Now; // create a timestamp to see how long this process takes
-            int maxRetries = 2000; // 0.1.9: increased due to rock collider detection. 0.1.10 rock collider detection removed but amount not changed. 1.3.6 rewrite to cache beforehand
-            int retries = maxRetries; // servers with high entity counts will require this
-
-            if (managedZones.Count == 0 && ZoneManager.CanCall())
-                SetupZoneManager();
-
-            do
+            foreach (var monument in monuments)
             {
-                var currentPos = RandomDropPosition();
-
-                if (currentPos == Vector3.zero)
-                    continue;
-
-                using var colliders = Pool.Get<PooledList<Collider>>();
-                Vis.Colliders(currentPos, radius + 15f, colliders, blockedMask, QueryTriggerInteraction.Collide); // get all colliders using the provided layermask
-
-                if (colliders.Count > 0) // if any colliders were found from the blockedMask then we don't want this as our dueling zone. retry.
+                if ((monument.Key - pos).sqrMagnitude < monument.Value) // don't put the dueling zone inside of a monument. players will throw a shit fit
                 {
-                    _gridPositions.Remove(currentPos);
-                    continue;
+                    return true;
                 }
+            }
 
-                if (DuelTerritory(currentPos, radius + 15f)) // check if position overlaps an existing zone
-                {
-                    _gridPositions.Remove(currentPos);
-                    continue; // overlaps, retry.
-                }
-
-                var positions = GetCircumferencePositions(currentPos, radius - 15f, 1f, 0f); // gather positions around the purposed zone
-                float min = 200f;
-                float max = -200f;
-                int water = 0;
-
-                foreach (var pos in positions)
-                {
-                    if (Physics.Raycast(new Vector3(pos.x, pos.y + 100f, pos.z), Vector3.down, 500f, Layers.Mask.Water)) //look for water
-                        water++; // count the amount of water colliders
-
-                    min = Mathf.Min(pos.y, min); // set the lowest and highest points of the terrain
-                    max = Mathf.Max(pos.y, max);
-                }
-
-                if (max - min > maxIncline || currentPos.y - min > maxIncline) // the incline is too steep to be suitable for a dueling zone, retry.
-                {
-                    _gridPositions.Remove(currentPos);
-                    continue;
-                }
-
-                if (water > positions.Count / 4) // too many water colliders, retry.
-                {
-                    _gridPositions.Remove(currentPos);
-                    continue;
-                }
-
-                positions.Clear();
-
-                if (currentPos != Vector3.zero)
-                    position = currentPos;
-            } while (position == Vector3.zero && --retries > 0); // prevent infinite loops
-
-            if (position != Vector3.zero)
-                Puts(msg("FoundZone", null, maxRetries - retries, (DateTime.Now - tick).TotalMilliseconds)); // we found a dueling zone! return the position to be assigned, spawn the zone and the spawn points!
-
-            return position;
+            return false;
         }
 
-        public List<Vector3> GetCircumferencePositions(Vector3 center, float radius, float next, float y) // as the name implies
+        public bool IsManagedZone(Vector3 v)
         {
-            var positions = new List<Vector3>();
+            if (ManagedZones.Count > 0)
+            {
+                foreach (var zone in ManagedZones.Values)
+                {
+                    if (zone.IsPositionInZone(v))
+                    {
+                        return zone.IsBlocked; // blocked by zone manager
+                    }
+                }
+            }
+            return false;
+        }
+
+        public bool ContainsTopology(TerrainTopology.Enum mask, Vector3 position, float radius)
+        {
+            return (TerrainMeta.TopologyMap.GetTopology(position, radius) & (int)mask) != 0;
+        }
+
+        public bool HasPointOnPathList(List<PathList> paths, Vector3 point, float radius)
+        {
+            return !paths.IsNullOrEmpty() && paths.Exists(path => path?.Path?.Points?.Exists(p => InRange(point, p, radius)) ?? false);
+        }
+
+        public static bool InRange2D(Vector3 a, Vector3 b, float distance)
+        {
+            return (a - b).SqrMagnitude2D() <= distance * distance;
+        }
+
+        public static bool InRange(Vector3 a, Vector3 b, float distance)
+        {
+            return (a - b).sqrMagnitude <= distance * distance;
+        }
+
+        public PooledList<Vector3> GetCircumferencePositions(Vector3 center, float radius, float next, float y) // as the name implies
+        {
+            var positions = GetPooledList<Vector3>();
             float degree = 0f;
 
             while (degree < 360)
@@ -5751,18 +6868,18 @@ namespace Oxide.Plugins
         public List<Vector3> GetAutoSpawns(DuelingZone zone)
         {
             var spawns = new List<Vector3>();
-            string key = zone.Position.ToString();
+            var key = zone.Location;
 
-            if (duelsData.AutoGeneratedSpawns.ContainsKey(key) && duelsData.AutoGeneratedSpawns[key].Count > 0)
-                spawns.AddRange(duelsData.AutoGeneratedSpawns[key].Select(spawn => spawn.ToVector3())); // use cached spawn points
+            if (data.AutoGeneratedSpawns.TryGetValue(key, out var value) && value.Count > 0)
+                spawns.AddRange(value); // use cached spawn points
 
-            if (!duelsData.AutoGeneratedSpawns.ContainsKey(key))
-                duelsData.AutoGeneratedSpawns.Add(key, new List<string>());
+            if (!data.AutoGeneratedSpawns.ContainsKey(key))
+                data.AutoGeneratedSpawns.Add(key, new());
 
             if (spawns.Count < 2)
-                spawns = CreateSpawnPoints(zone.Position, zone.ProtectionRadius); // create spawn points on the fly
+                spawns = CreateSpawnPoints(zone.Location, zone.ProtectionRadius); // create spawn points on the fly
 
-            duelsData.AutoGeneratedSpawns[key] = new(spawns.Select(spawn => spawn.ToString()));
+            data.AutoGeneratedSpawns[key] = new(spawns);
             return spawns;
         }
 
@@ -5771,24 +6888,30 @@ namespace Oxide.Plugins
             var positions = new List<Vector3>(); // 0.1.1 bugfix: spawn point height (y) wasn't being modified when indexing the below foreach list. instead, create a copy of each position and return a new list (cause: can't modify members of value types without changing the collection and invalidating the enumerator. bug: index the value type and change the value. result: list did not propagate)
 
             // create spawn points slightly inside of the dueling zone so they don't spawn inside of walls
-            foreach (var position in GetCircumferencePositions(center, radius - 15f, 10f, 0f))
+            using var vectors = GetCircumferencePositions(center, radius - 15f, 5f, 0f);
+            foreach (var v in vectors)
             {
-                float y = TerrainMeta.HeightMap.GetHeight(position); // 1.3.6 rewrite
-
-                if (Physics.Raycast(position + new Vector3(0f, 50f), Vector3.down, out var hit, 51f, Layers.Solid, QueryTriggerInteraction.Ignore))
+                Vector3 pos = new(v.x, 0f, v.z);
+                pos.y = GetSpawnHeight(pos, center.y + radius); // 1.3.6 rewrite
+                if (ValidSpawnPoint(pos))
                 {
-                    y = Mathf.Max(y, hit.point.y);
+                    pos.y += 0.75f;
+                    positions.Add(pos);
                 }
-
-                var spawnPos = new Vector3(position.x, y, position.z);
-
-                if (avoidWaterSpawns && TerrainMeta.WaterMap.GetHeight(position) - y > 0.8f)
-                    continue; // 0.1.16: better method to check water level
-
-                positions.Add(spawnPos);
             }
 
             return positions;
+        }
+
+        private bool ValidSpawnPoint(Vector3 spawnPos)
+        {
+            if (avoidWaterSpawns && WaterLevel.GetWaterDepth(spawnPos, true, true, null) > 0.6f)
+                return false; // 0.1.16 / 1.3.6: better method to check water level
+
+            if (GamePhysics.CheckCapsule(spawnPos + Vector3.up * 0.6f, spawnPos + Vector3.up * 1.4f, 0.5f, Layers.Mask.World, QueryTriggerInteraction.Ignore))
+                return false; // check for any rocks the player might clip into and become stuck
+
+            return true;
         }
 
         public bool ResetDuelists() // reset all data for the wipe after assigning awards
@@ -5797,25 +6920,18 @@ namespace Oxide.Plugins
             {
                 if (resetSeed)
                 {
-                    duelsData.VictoriesSeed.Clear();
-                    duelsData.LossesSeed.Clear();
-                    duelsData.MatchKillsSeed.Clear();
-                    duelsData.MatchDeathsSeed.Clear();
-                    duelsData.MatchLossesSeed.Clear();
-                    duelsData.MatchVictoriesSeed.Clear();
-                    duelsData.MatchSizesVictoriesSeed.Clear();
-                    duelsData.MatchSizesVictoriesSeed.Clear();
+                    data.ResetSeed();
                 }
 
                 if (wipeDuelZones)
                 {
-                    duelsData.Zones.Clear();
-                    duelsData.Spawns.Clear();
-                    duelsData.AutoGeneratedSpawns.Clear();
+                    data.Zones.Clear();
+                    data.Spawns.Clear();
+                    data.AutoGeneratedSpawns.Clear();
                 }
 
-                duelsData.Bets.Clear();
-                duelsData.ClaimBets.Clear();
+                data.Bets.Clear();
+                data.ClaimBets.Clear();
                 ResetTemporaryData();
             }
 
@@ -5824,9 +6940,6 @@ namespace Oxide.Plugins
 
         public bool AssignDuelists()
         {
-            if (!recordStats || duelsData.VictoriesSeed.Count == 0)
-                return true; // nothing to do here, return
-
             foreach (var target in covalence.Players.All) // remove player awards from previous wipe
             {
                 if (permission.UserHasPermission(target.Id, duelistPerm))
@@ -5836,10 +6949,13 @@ namespace Oxide.Plugins
                     permission.RemoveUserGroup(target.Id, duelistGroup);
             }
 
+            if (!recordStats || data.Get(Points.VictorySeed).Count == 0)
+                return true; // nothing to do here, return
+
             if (permsToGive <= 0) // check now incase the user disabled awards later on
                 return true;
 
-            using var duelists = GetPool(duelsData.VictoriesSeed); // sort the data
+            using var duelists = GetPooledList(data.Get(Points.VictorySeed)); // sort the data
             duelists.Sort((x, y) => y.Value.CompareTo(x.Value));
 
             int added = 0;
@@ -5869,37 +6985,84 @@ namespace Oxide.Plugins
 
         public bool IsNewman(BasePlayer player) // count the players items. exclude rocks and torchs
         {
-            if (bypassNewmans || saveRestoreEnabled)
+            if (bypassNewmans)
                 return true;
 
-            List<Item> itemList = Pool.Get<List<Item>>();
-            int count = player.inventory.GetAllItems(itemList);
-            Pool.FreeUnmanaged(ref itemList);
+            int count = 0;
+            for (int i = 0; i < 6; i++)
+            {
+                Item item = player.inventory.containerBelt.GetSlot(i);
+                if (item != null && !IgnoredNakedShortnames.Contains(item.info.shortname))
+                {
+                    count++;
+                }
+            }
 
-            if (permission.UserHasPermission(player.UserIDString, "permamap.use") && player.inventory.containerBelt.GetSlot(6) != null)
-                count -= 1;
+            for (int i = 0; i < 8; i++)
+            {
+                Item item = player.inventory.containerWear.GetSlot(i);
+                if (item != null && !IgnoredNakedShortnames.Contains(item.info.shortname))
+                {
+                    count++;
+                }
+            }
 
-            count -= respawnLoot.Sum(entry => GetAmount(player, entry.shortname));
+            for (int i = 0; i < 24; i++)
+            {
+                Item item = player.inventory.containerMain.GetSlot(i);
+                if (item != null && !IgnoredNakedShortnames.Contains(item.info.shortname))
+                {
+                    count++;
+                }
+            }
 
-            return count == 0;
+            return count <= 0;
         }
 
-        public int GetAmount(BasePlayer player, string shortname)
+        public void LeaveEvent(BasePlayer player)
         {
-            List<Item> itemList = Pool.Get<List<Item>>();
-            player.inventory.GetAllItems(itemList);
-            int count = itemList.Where(x => x.info.shortname.Equals(shortname, StringComparison.CurrentCultureIgnoreCase)).Sum(item => item.amount);
-            Pool.FreeUnmanaged(ref itemList);
-            return count;
-        }
+            if (player == null)
+                return;
+            if (GetDeathmatch(player, out var match))
+            {
+                Reappear(player);
+                match.EndMatch(match.GetTeam(player) == Team.Evil ? Team.Good : Team.Evil);
+            }
+            else if (IsDueling(player))
+            {
+                Reappear(player);
+                player.inventory.Strip();
+                OnDuelistLost(player, sendHome: true, ready: false);
+            }
+            else if (IsSpectator(player))
+            {
+                EndSpectate(player);
+                SendHome(player);
+            }
 
+            CuiHelper.DestroyUi(player, "DuelistUI_Defeat");
+        }
+        
         public bool RemoveFromQueue(string targetId)
         {
-            foreach (var kvp in duelsData.Queued)
+            foreach (var kvp in Queued)
             {
-                if (kvp.Value == targetId)
+                if (kvp.Value.ID == targetId)
                 {
-                    duelsData.Queued.Remove(kvp.Key);
+                    Queued.Remove(kvp.Key);
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private bool InQueue(string userid)
+        {
+            foreach (var data in Queued.Values)
+            {
+                if (data.ID == userid)
+                {
                     return true;
                 }
             }
@@ -5909,121 +7072,105 @@ namespace Oxide.Plugins
 
         public void CheckQueue()
         {
-            if (duelsData.Queued.Count < 2 || !duelsData.DuelsEnabled)
+            if (Queued.Count < 2 || !data.DuelsEnabled)
                 return;
 
-            string playerId = duelsData.Queued.Values.ElementAt(0);
-            string targetId = duelsData.Queued.Values.ElementAt(1);
-            var player = BasePlayer.Find(playerId);
-            var target = BasePlayer.Find(targetId);
+            var playerData = Queued.Values.ElementAt(0);
+            var targetData = Queued.Values.ElementAt(1);
+            var player = playerData.GetPlayer();
+            var target = targetData.GetPlayer();
 
-            if (player == null || !player.CanInteract() || InMatch(player))
+            if (player == null || !player.CanInteract() || IsTeamMember(player))
             {
-                if (RemoveFromQueue(playerId))
+                if (RemoveFromQueue(playerData.ID))
                     CheckQueue();
-
                 return;
             }
 
-            if (target == null || !player.CanInteract() || InMatch(player))
+            if (target == null || !player.CanInteract() || IsTeamMember(player))
             {
-                if (RemoveFromQueue(targetId))
+                if (RemoveFromQueue(targetData.ID))
                     CheckQueue();
-
                 return;
             }
 
             if (!IsNewman(player))
             {
                 if (RemoveFromQueue(player.UserIDString))
-                    Message(player, msg("MustBeNaked", player.UserIDString));
+                    Message(player, "MustBeNaked");
                 return;
             }
 
             if (!IsNewman(target))
             {
                 if (RemoveFromQueue(target.UserIDString))
-                    Message(target, msg("MustBeNaked", target.UserIDString));
+                    Message(target, "MustBeNaked");
                 return;
             }
 
-            SelectZone(player, target);
+            SelectZone(player, target, true);
         }
 
-        public bool SelectZone(BasePlayer player, BasePlayer target)
+        public DuelingZone GetPlayerZone(BasePlayer player, int size)
         {
-            var lastZone = GetPlayerZone(player, 2) ?? GetPlayerZone(target, 2) ?? GetDuelZone(player.transform.position) ?? GetDuelZone(target.transform.position);
+            if (!playerZones.Remove(player.UserIDString, out var zone))
+                return null;
 
-            if (lastZone != null)
+            if (size > 2)
+                return zone == null || zone.IsFinito || zone.IsLocked || zone.Spawns.Count < (requireTeamSize ? size * 2 : 2) ? null : zone;
+
+            return zone == null || zone.IsFinito || zone.IsLocked || zone.Spawns.Count < requiredMinSpawns || requiredMaxSpawns > 0 && zone.Spawns.Count > requiredMaxSpawns ? null : zone;
+        }
+
+        public bool SelectZone(BasePlayer player, BasePlayer target, bool isQueued)
+        {
+            DuelingZone lastZone = GetPlayerZone(player, 2) ?? GetPlayerZone(target, 2);
+            bool isPaymentCompleted = false;
+
+            if (lastZone != null && lastZone.GetSelectionResult(player, target, isQueued, isPaymentRequired: true, out isPaymentCompleted) == SelectionResult.Initiate)
             {
-                var success = lastZone.AddWaiting(player, target);
-
-                if (success != null && success is bool && (bool)success)
-                {
-                    Initiate(player, target, false, lastZone);
-                    return true;
-                }
+                Initiate(player, target, false, lastZone);
+                return true;
             }
 
-            using var zones = GetPool(duelingZones.Where(zone => !zone.IsFull && !zone.IsLocked && zone.Spawns.Count >= requiredMinSpawns && zone.Spawns.Count <= requiredMaxSpawns));
-
-            while (zones.Count > 0)
+            foreach (DuelingZone zone in duelingZones)
             {
-                var zone = zones.GetRandom();
-                var success = zone.AddWaiting(player, target);
+                if (!IsZoneAvailable(zone, requiredMinSpawns, requiredMaxSpawns))
+                    continue;
 
-                if (success == null) // user must pay the duel entry fee first
-                    return true;
+                SelectionResult result = zone.GetSelectionResult(player, target, isQueued, isPaymentRequired: !isPaymentCompleted, out _);
+                if (result == SelectionResult.Full)
+                    continue;
 
-                if (success is bool v && v)
-                {
+                if (result == SelectionResult.Initiate)
                     Initiate(player, target, false, zone);
-                    return true;
-                }
 
-                zones.Remove(zone);
+                return true;
             }
-            ;
 
             return false;
         }
 
         public string GetKit(BasePlayer player, BasePlayer target)
         {
-            string kit = GetRandomKit();
-
-            if (duelsData.CustomKits.ContainsKey(player.UserIDString) && duelsData.CustomKits.ContainsKey(target.UserIDString))
+            if (data.CustomKits.TryGetValue(player.UserIDString, out var p) && data.CustomKits.TryGetValue(target.UserIDString, out var t) && p.Equals(t, StringComparison.CurrentCultureIgnoreCase))
             {
-                string playerKit = duelsData.CustomKits[player.UserIDString];
-                string targetKit = duelsData.CustomKits[target.UserIDString];
-
-                if (playerKit.Equals(targetKit, StringComparison.CurrentCultureIgnoreCase))
-                {
-                    return GetVerifiedKit(playerKit) ?? kit;
-                }
+                return GetVerifiedKit(p) ?? GetRandomKit();
             }
 
-            return kit;
+            return GetRandomKit();
         }
 
         public void VerifyKits()
         {
-            if (Kits.CanCall())
+            if (lpDuelingKits.Count == 0 && hpDuelingKits.Count == 0)
             {
-                using var kits = GetPool(lpDuelingKits, hpDuelingKits);
-                using var remove = GetPool<string>();
-                foreach (string kit in kits)
-                {
-                    if (!IsKit(kit))
-                    {
-                        remove.Add(kit);
-                    }
-                }
-                if (kits.Count == remove.Count)
-                {
-                    return;
-                }
-                foreach (string kit in remove)
+                return;
+            }
+            using var kits = GetPooledList(lpDuelingKits, hpDuelingKits);
+            foreach (string kit in kits)
+            {
+                if (!IsKit(kit) && !customKits.ContainsKey(kit))
                 {
                     lpDuelingKits.Remove(kit);
                     hpDuelingKits.Remove(kit);
@@ -6035,7 +7182,7 @@ namespace Oxide.Plugins
         {
             VerifyKits();
 
-            if (Random.value < lesserKitChance && lpDuelingKits.Count > 0)
+            if (lesserKitChance > 0 && lpDuelingKits.Count > 0 && Random.value < lesserKitChance)
             {
                 return lpDuelingKits.GetRandom();
             }
@@ -6057,64 +7204,69 @@ namespace Oxide.Plugins
         {
             try
             {
-                if (player == null || target == null || destZone == null)
+                if (player == null || target == null)
                     return;
 
-                dataRequests.Remove(player.UserIDString);
-                dataRequests.Remove(target.UserIDString);
+                RemoveRequests(player);
+                RemoveRequests(target);
+
+                if (destZone == null)
+                    return;
 
                 if (checkInventory)
                 {
                     if (!IsNewman(player))
                     {
-                        Message(player, msg("MustBeNaked", player.UserIDString));
-                        Message(target, msg("DuelMustBeNaked", target.UserIDString, player.displayName));
+                        Message(player, "MustBeNaked");
+                        Message(target, "DuelMustBeNaked", player.displayName);
                         return;
                     }
 
                     if (!IsNewman(target))
                     {
-                        Message(target, msg("MustBeNaked", player.UserIDString));
-                        Message(player, msg("DuelMustBeNaked", player.UserIDString, target.displayName));
+                        Message(target, "MustBeNaked");
+                        Message(player, "DuelMustBeNaked", target.displayName);
                         return;
                     }
                 }
 
-                if (!DuelTerritory(player.transform.position) || !duelsData.Homes.ContainsKey(player.UserIDString))
+                var a = player.transform.position;
+                var plyInRange = destZone.InRange(a);
+                if (!plyInRange || !data.Homes.ContainsKey(player.UserIDString))
                 {
-                    var ppos = player.transform.position;
-                    if (IsOnConstruction(ppos)) ppos.y += 1; // prevent player from becoming stuck or dying when teleported home
-                    duelsData.Homes[player.UserIDString] = ppos.ToString();
+                    if (IsOnConstruction(a)) a.y += 1; // prevent player from becoming stuck or dying when teleported home
+                    data.Homes[player.UserIDString] = a;
                 }
 
-                if (!DuelTerritory(target.transform.position) || !duelsData.Homes.ContainsKey(target.UserIDString))
+                var b = target.transform.position;
+                var tgtInRange = destZone.InRange(b);
+                if (!tgtInRange || !data.Homes.ContainsKey(target.UserIDString))
                 {
-                    var tpos = target.transform.position;
-                    if (IsOnConstruction(tpos)) tpos.y += 1;
-                    duelsData.Homes[target.UserIDString] = tpos.ToString();
+                    if (IsOnConstruction(b)) b.y += 1;
+                    data.Homes[target.UserIDString] = b;
                 }
 
                 var playerSpawn = destZone.Spawns.GetRandom();
                 var targetSpawn = playerSpawn;
-                float dist = -100f;
+                float distSq = -1000f;
 
                 foreach (var spawn in destZone.Spawns) // get the furthest spawn point away from the player and assign it to target
                 {
-                    float distance = Vector3.Distance(spawn, playerSpawn);
+                    float distanceSq = (spawn - playerSpawn).sqrMagnitude;
 
-                    if (distance > dist)
+                    if (distanceSq > distSq)
                     {
-                        dist = distance;
+                        distSq = distanceSq;
                         targetSpawn = spawn;
                     }
                 }
 
                 string kit = GetKit(player, target);
-                duelsData.Kits[player.UserIDString] = kit;
-                duelsData.Kits[target.UserIDString] = kit;
+                data.Kits[player.UserIDString] = kit;
+                data.Kits[target.UserIDString] = kit;
 
-                Teleport(player, playerSpawn);
-                Teleport(target, targetSpawn);
+                Teleport(player, playerSpawn, destZone.ProtectionRadius, !plyInRange);
+                Teleport(target, targetSpawn, destZone.ProtectionRadius, !tgtInRange);
 
                 if (debugMode)
                     Puts($"{player.displayName} and {target.displayName} have entered a duel.");
@@ -6122,32 +7274,31 @@ namespace Oxide.Plugins
                 RemoveFromQueue(player.UserIDString);
                 RemoveFromQueue(target.UserIDString);
 
-                if (immunityTime >= 1)
-                {
-                    dataImmunity[player.UserIDString] = TimeStamp() + immunityTime;
-                    dataImmunity[target.UserIDString] = TimeStamp() + immunityTime;
-                    dataImmunitySpawns[player.UserIDString] = playerSpawn;
-                    dataImmunitySpawns[target.UserIDString] = targetSpawn;
-                }
+                EnableUserImmunity(player, playerSpawn);
+                EnableUserImmunity(target, targetSpawn);
 
-                dataDuelists[player.UserIDString] = target.UserIDString;
-                dataDuelists[target.UserIDString] = player.UserIDString;
+                _duelists[player.UserIDString] = new(target);
+                _duelists[target.UserIDString] = new(player);
                 SubscribeHooks(true);
 
-                Message(player, msg("NowDueling", player.UserIDString, target.displayName));
-                Message(target, msg("NowDueling", target.UserIDString, player.displayName));
+                Message(player, "NowDueling", target.displayName);
+                Message(target, "NowDueling", player.displayName);
 
+                if (useInvisibility)
+                {
+                    Disappear(player);
+                    Disappear(target);
+                }
+
+                HolsterWeapon(player);
+                HolsterWeapon(target);
             }
             catch (Exception ex)
             {
                 SubscribeHooks(false);
-                duelsData.DuelsEnabled = false;
+                data.DuelsEnabled = false;
                 SaveData();
-
-                Puts("---");
-                Puts("Plugin disabled: {0} --- {1}", ex.Message, ex.StackTrace);
-                Puts("---");
-
+                Puts("---\nPlugin disabled: {0} --- {1}\n---", ex.Message, ex.StackTrace);
                 ResetDuelist(player.UserIDString);
                 ResetDuelist(target.UserIDString);
             }
@@ -6163,18 +7314,18 @@ namespace Oxide.Plugins
             return player != null && target != null && IsAllied(player, target);
         }
 
-        private HashSet<BuildingPrivlidge> _allyPrivileges = new();
-        private HashSet<CodeLock> _allyCodes = new();
+        private HashSet<BuildingPrivlidge> _privileges = new();
+        private HashSet<CodeLock> _codes = new();
         private Coroutine _allyCo;
 
-        private void OnEntitySpawned(BuildingPrivlidge priv) => _allyPrivileges.Add(priv);
+        private void OnEntitySpawned(BuildingPrivlidge priv) => _privileges.Add(priv);
 
-        private void OnEntitySpawned(CodeLock codelock) => _allyCodes.Add(codelock);
+        private void OnEntitySpawned(CodeLock codelock) => _codes.Add(codelock);
 
         private IEnumerator SetupAllyEntitiesCo()
         {
             int checks = 0;
-            using var ents = GetPool(BaseNetworkable.serverEntities);
+            using var ents = GetPooledList(BaseNetworkable.serverEntities);
             foreach (var ent in ents)
             {
                 if (++checks >= 200)
@@ -6188,13 +7339,13 @@ namespace Oxide.Plugins
                 BuildingPrivlidge priv = ent as BuildingPrivlidge;
                 if (priv != null)
                 {
-                    _allyPrivileges.Add(priv);
+                    _privileges.Add(priv);
                     continue;
                 }
                 CodeLock codelock = ent as CodeLock;
                 if (codelock != null)
                 {
-                    _allyCodes.Add(codelock);
+                    _codes.Add(codelock);
                     continue;
                 }
             }
@@ -6203,14 +7354,14 @@ namespace Oxide.Plugins
 
         public bool IsAllied(BasePlayer player, BasePlayer target)
         {
-            if (player.IsAdmin && target.IsAdmin)
+            if (player == null || target == null || player.IsAdmin && target.IsAdmin)
                 return false;
 
             if (IsOnSameTeam(player, target) || IsInSameClan(player, target) || IsBunked(player, target))
                 return true;
 
-            _allyPrivileges.RemoveWhere(IsNull);
-            foreach (var priv in _allyPrivileges)
+            _privileges.RemoveWhere(IsNull);
+            foreach (var priv in _privileges)
             {
                 if (!priv.AnyAuthed() || !priv.IsAuthed(player))
                 {
@@ -6240,8 +7391,8 @@ namespace Oxide.Plugins
                 }
             }
 
-            _allyCodes.RemoveWhere(IsNull);
-            foreach (var codelock in _allyCodes)
+            _codes.RemoveWhere(IsNull);
+            foreach (var codelock in _codes)
             {
                 if (codelock.whitelistPlayers.Contains(player.userID) && codelock.whitelistPlayers.Contains(target.userID))
                 {
@@ -6264,15 +7415,18 @@ namespace Oxide.Plugins
 
         private bool IsBunked(BasePlayer player, BasePlayer target) // 3rd method. thanks @i_love_code for helping with this too
         {
-            var bags = SleepingBag.FindForPlayer(target.userID, true);
-
-            if (bags.Length > 0)
+            using var bags1 = SleepingBag.FindForPlayer(target.userID, true);
+            if (bags1.Count > 0)
             {
-                foreach (var a in SleepingBag.FindForPlayer(player.userID, true))
+                using var bags2 = SleepingBag.FindForPlayer(player.userID, true);
+                foreach (var a in bags2)
                 {
-                    if (bags.Exists(b => a.buildingID == b.buildingID))
+                    foreach (var b in bags1)
                     {
-                        return true;
+                        if (a.buildingID == b.buildingID)
+                        {
+                            return true;
+                        }
                     }
                 }
             }
@@ -6313,7 +7467,8 @@ namespace Oxide.Plugins
                 player.metabolism.radiation_poison.Reset();
             }
 
-            player.metabolism.SendChangesToClient();
+            player.metabolism.bleeding.value = 0;
+            player.metabolism.SendChanges();
         }
 
         public bool IsKit(string kit)
@@ -6323,44 +7478,47 @@ namespace Oxide.Plugins
 
         public void AwardPlayer(string id, double money, int points)
         {
-            if (money == 0.0 && points == 0)
+            if (money <= 0.0 && points <= 0)
                 return;
 
-            ulong playerId = Convert.ToUInt64(id);
+            ulong userid = Convert.ToUInt64(id);
+            if (!userid.IsSteamId())
+                return;
 
             if (money > 0.0)
             {
+                Plugin Economics = plugins.Find("Economics");
                 if (Economics.CanCall())
                 {
-                    Economics?.Call("Deposit", playerId, money);
-                    var player = BasePlayer.FindByID(playerId);
+                    Economics?.Call("Deposit", userid, money);
 
+                    var player = BasePlayer.FindByID(userid);
                     if (player != null)
-                        Message(player, msg("EconomicsDeposit", player.UserIDString, money));
+                        Message(player, "EconomicsDeposit", money);
                 }
             }
 
             if (points > 0)
             {
+                Plugin ServerRewards = plugins.Find("ServerRewards");
                 if (ServerRewards.CanCall())
                 {
-                    var success = Convert.ToBoolean(ServerRewards?.Call("AddPoints", playerId, points));
-                    var player = BasePlayer.FindByID(playerId);
+                    ServerRewards?.Call("AddPoints", userid, points);
 
-                    if (player != null && success)
-                        Message(player, msg("ServerRewardPoints", player.UserIDString, points));
+                    var player = BasePlayer.FindByID(userid);
+                    if (player != null)
+                        Message(player, "ServerRewardPoints", points);
                 }
             }
         }
 
-        public void GivePlayerKit(BasePlayer player)
+        public void GivePlayerKit(BasePlayer player, bool isMatch)
         {
             if (player == null)
                 return;
 
-            string kit = duelsData.Kits.ContainsKey(player.UserIDString) ? duelsData.Kits[player.UserIDString] : string.Empty;
+            string kit = data.Kits.Remove(player.UserIDString, out string k) ? k : string.Empty;
 
-            duelsData.Kits.Remove(player.UserIDString);
             player.inventory.Strip();
 
             if (!string.IsNullOrEmpty(kit))
@@ -6377,10 +7535,10 @@ namespace Oxide.Plugins
 
                 if (string.IsNullOrEmpty(kit))
                 {
-                    kit = duelsData.CustomKits.ContainsKey(player.UserIDString) ? duelsData.CustomKits[player.UserIDString] : null;
+                    kit = data.CustomKits.ContainsKey(player.UserIDString) ? data.CustomKits[player.UserIDString] : null;
                 }
 
-                if (GiveCustomKit(player, kit))
+                if (GiveCustomKit(player, kit, isMatch))
                 {
                     return;
                 }
@@ -6399,6 +7557,11 @@ namespace Oxide.Plugins
                         return;
                     }
                 }
+
+                if (GiveCustomKit(player, kit, isMatch))
+                {
+                    return;
+                }
             }
 
             // give a basic kit when no kit is provided, or the provided kit is invalid
@@ -6410,16 +7573,25 @@ namespace Oxide.Plugins
             player.inventory.GiveItem(ItemManager.CreateByItemID(1079279582, 4, 0)); // syringe
         }
 
-        public bool GiveCustomKit(BasePlayer player, string kit)
+        public bool GiveCustomKit(BasePlayer player, string kit, bool isMatch)
         {
-            if (string.IsNullOrEmpty(kit) || customKits.Count == 0 || !customKits.ContainsKey(kit))
+            if (string.IsNullOrEmpty(kit) || customKits.Count == 0 || !customKits.TryGetValue(kit, out var items))
                 return false;
 
             bool success = false;
 
-            foreach (var dki in customKits[kit])
+            foreach (var dki in items)
             {
-                Item item = ItemManager.CreateByName(dki.shortname, dki.amount, dki.skin);
+                if (isMatch && dki.shortname.Contains("hoodie"))
+                {
+                    continue;
+                }
+
+                ItemDefinition def = ItemManager.FindItemDefinition(dki.shortname);
+                if (def == null) continue;
+
+                ulong dkiskin = RequiresOwnership(def, dki.skin) ? 0 : dki.skin;
+                Item item = ItemManager.CreateByName(dki.shortname, dki.amount, dkiskin);
 
                 if (item == null)
                 {
@@ -6432,9 +7604,12 @@ namespace Oxide.Plugins
                     var skins = GetItemSkins(item.info);
 
                     if (skins.Count > 0)
-                        item.skin = skins.GetRandom();
+                    {
+                        ulong skin = skins.GetRandom();
+                        item.skin = skin; //ItemDefinition.FindSkin(item.info.itemid, (int)skin);
+                    }
                 }
-
+                
                 if (dki.mods != null)
                 {
                     foreach (string shortname in dki.mods)
@@ -6446,7 +7621,7 @@ namespace Oxide.Plugins
                     }
                 }
 
-                var heldEntity = item.GetHeldEntity();
+                var heldEntity = item.GetHeldEntity() as HeldEntity;
 
                 if (heldEntity != null)
                 {
@@ -6459,15 +7634,17 @@ namespace Oxide.Plugins
                     {
                         if (!string.IsNullOrEmpty(dki.ammo))
                         {
-                            var def = ItemManager.FindItemDefinition(dki.ammo);
+                            var def2 = ItemManager.FindItemDefinition(dki.ammo);
 
-                            if (def != null)
-                                weapon.primaryMagazine.ammoType = def;
+                            if (def2 != null)
+                                weapon.primaryMagazine.ammoType = def2;
                         }
 
                         weapon.primaryMagazine.contents = 0; // unload the old ammo
-                        weapon.SendNetworkUpdateImmediate(false); // update
+                        weapon.SendNetworkUpdateImmediate(); // update
                         weapon.primaryMagazine.contents = weapon.primaryMagazine.capacity; // load new ammo
+
+                        heldEntity.SetHeld(false);
                     }
                 }
 
@@ -6476,6 +7653,7 @@ namespace Oxide.Plugins
                 item.MarkDirty();
                 if (item.MoveToContainer(container, dki.slot < 0 || dki.slot > container.capacity - 1 ? -1 : dki.slot, true))
                 {
+                    player.UpdateActiveItem(default);
                     success = true;
                 }
                 else
@@ -6489,7 +7667,7 @@ namespace Oxide.Plugins
 
         private void DuelAnnouncement(bool bypass)
         {
-            if (!bypass && (!duelsData.DuelsEnabled || !useAnnouncement))
+            if (!bypass && (!data.DuelsEnabled || !useAnnouncement))
                 return;
 
             if (BasePlayer.activePlayerList.Count < 3)
@@ -6507,18 +7685,19 @@ namespace Oxide.Plugins
 
             Puts(RemoveFormatting(console));
 
-            foreach (var player in BasePlayer.activePlayerList.Where(p => p?.displayName != null))
+            using var targets = GetPlayerList();
+            foreach (var target in targets)
             {
-                string message = msg("DuelAnnouncement", player.UserIDString);
+                string message = msg("DuelAnnouncement", target.UserIDString);
 
                 message = message.Replace("{duelChatCommand}", !string.IsNullOrEmpty(szDuelChatCommand) ? szDuelChatCommand : disabled);
                 message = message.Replace("{ladderCommand}", !string.IsNullOrEmpty(szDuelChatCommand) ? string.Format("{0} ladder", szDuelChatCommand) : disabled);
                 message = message.Replace("{queueCommand}", !string.IsNullOrEmpty(szQueueChatCommand) ? szQueueChatCommand : disabled);
 
                 if (allowBets)
-                    message += msg("DuelAnnouncementBetsSuffix", player.UserIDString, szDuelChatCommand);
+                    message += msg("DuelAnnouncementBetsSuffix", target.UserIDString, szDuelChatCommand);
 
-                Message(player, string.Format("{0} <color=#C0C0C0>{1}</color>", lang.GetMessage("Prefix", this, player.UserIDString), message));
+                MessageB(target, $"{msg("Prefix", target.UserIDString)} <color=#C0C0C0>{message}</color>");
             }
         }
 
@@ -6531,42 +7710,41 @@ namespace Oxide.Plugins
 
             if (amount == 0)
             {
-                Message(player, msg("BetZero", player.UserIDString));
+                Message(player, "BetZero");
                 return false;
             }
 
             if (amount < betAmount) // obviously they're just trying to see how this works. we won't adjust it here.
             {
-                Message(player, msg("BetNotEnough", player.UserIDString));
+                Message(player, "BetNotEnough");
                 return false;
             }
 
-            using var takenItems = GetPool<Item>();
+            using var takenItems = GetPooledList<Item>();
             int takenAmount = player.inventory.Take(takenItems, betInfo.itemid, betAmount);
 
-            if (takenAmount == betAmount)
+            if (takenAmount >= betAmount)
             {
-                var bet = new BetInfo
+                data.Bets.Add(player.UserIDString, new()
                 {
                     itemid = betInfo.itemid,
                     amount = betAmount,
                     trigger = betInfo.trigger
-                };
+                });
 
-                duelsData.Bets.Add(player.UserIDString, bet);
-
-                string message = msg("BetPlaced", player.UserIDString, betInfo.trigger, betAmount);
+                using var sb = DisposableBuilder.Get();
+                sb.Append(msg("BetPlaced", player.UserIDString, betInfo.trigger, betAmount));
 
                 if (allowBetRefund)
-                    message += msg("BetRefundSuffix", player.UserIDString, szDuelChatCommand);
+                    sb.Append(msg("BetRefundSuffix", player.UserIDString, szDuelChatCommand));
                 else if (allowBetForfeit)
-                    message += msg("BetForfeitSuffix", player.UserIDString, szDuelChatCommand);
+                    sb.Append(msg("BetForfeitSuffix", player.UserIDString, szDuelChatCommand));
 
-                Message(player, message);
+                MessageB(player, sb.ToString());
                 Puts("{0} bet {1} ({2})", player.displayName, betInfo.trigger, betAmount);
 
                 foreach (Item item in takenItems)
-                    item.Remove(0.1f);
+                    item.Remove(0.01f);
 
                 return true;
             }
@@ -6574,29 +7752,20 @@ namespace Oxide.Plugins
             if (takenItems.Count > 0)
             {
                 foreach (Item item in takenItems)
-                    player.GiveItem(item, BaseEntity.GiveItemReason.Generic);
+                    player.GiveItem(item);
             }
 
             return false;
         }
 
-        private void GetWorkshopIDs(int code, string response)
+        private bool IsBlacklistedSkin(ItemDefinition def, int num)
         {
-            if (!string.IsNullOrEmpty(response) && code == 200)
-            {
-                var items = JsonConvert.DeserializeObject<ItemSchema>(response).items;
+            if (RequiresOwnership(def, (ulong)num)) return true;
+            var skinId = ItemDefinition.FindSkin(def.isRedirectOf?.itemid ?? def.itemid, num);
+            var dirSkin = def.isRedirectOf == null ? def.skins.FirstOrDefault(x => (ulong)x.id == skinId) : def.isRedirectOf.skins.FirstOrDefault(x => (ulong)x.id == skinId);
+            var itemSkin = (dirSkin.id == 0) ? null : (dirSkin.invItem as ItemSkin);
 
-                foreach (var item in items)
-                {
-                    if (string.IsNullOrEmpty(item.itemshortname) || string.IsNullOrEmpty(item.workshopdownload))
-                        continue;
-
-                    if (!workshopskinsCache.ContainsKey(item.itemshortname))
-                        workshopskinsCache.Add(item.itemshortname, new());
-
-                    workshopskinsCache[item.itemshortname].Add(Convert.ToUInt64(item.workshopdownload));
-                }
-            }
+            return itemSkin?.Redirect != null || def.isRedirectOf != null;
         }
 
         public List<ulong> GetItemSkins(ItemDefinition def)
@@ -6604,18 +7773,34 @@ namespace Oxide.Plugins
             if (!skinsCache.ContainsKey(def.shortname))
             {
                 var skins = new List<ulong>();
-
-                skins.AddRange(def.skins.Select(skin => Convert.ToUInt64(skin.id)));
-
-                if (useWorkshopSkins && workshopskinsCache.ContainsKey(def.shortname))
+                if (def.skins != null)
                 {
-                    skins.AddRange(workshopskinsCache[def.shortname]);
-                    workshopskinsCache.Remove(def.shortname);
+                    foreach (var skin in def.skins)
+                    {
+                        if (IsBlacklistedSkin(def, skin.id))
+                        {
+                            continue;
+                        }
+                        skins.Add(Convert.ToUInt64(skin.id));
+                    }
                 }
 
-                if (skins.Contains(0uL))
-                    skins.Remove(0uL);
+                if (def.skins2 != null && useWorkshopSkins)
+                {
+                    foreach (var skin in def.skins2)
+                    {
+                        if (skin == null || IsBlacklistedSkin(def, (int)skin.WorkshopId))
+                        {
+                            continue;
+                        }
+                        if (!skins.Contains(skin.WorkshopId))
+                        {
+                            skins.Add(skin.WorkshopId);
+                        }
+                    }
+                }
 
+                skins.Remove(0uL);
                 skinsCache.Add(def.shortname, skins);
             }
 
@@ -6624,85 +7809,340 @@ namespace Oxide.Plugins
 
         private void RemoveRequests(BasePlayer player)
         {
-            using var requests = GetPool(dataRequests);
-            foreach (var entry in requests)
+            if (player != null && GetRequest(player.UserIDString, out var request))
             {
-                if (entry.Key == player.UserIDString || entry.Value == player.UserIDString)
+                dataRequests.Remove(request.Key);
+            }
+        }
+
+        private void UpdateMatchSizeStats(string userid, int teamSize, Points stat)
+        {
+            if (!userid.IsSteamId()) 
+                return;
+
+            data.Add(userid, stat == Points.MatchVictory ? Points.MatchSizeVictorySeed : Points.MatchSizeLossSeed, teamSize);
+            data.Add(userid, stat == Points.MatchVictory ? Points.MatchSizeVictory : Points.MatchSizeLoss, teamSize);
+        }
+
+        private void UpdateMatchStats(string userid, Points stat)
+        {
+            if (!userid.IsSteamId())
+                return;
+
+            switch (stat)
+            {
+                case Points.MatchVictory:
+                    data.Add(userid, Points.MatchVictory);
+                    data.Add(userid, Points.MatchVictorySeed);
+                    break;
+                case Points.MatchLoss:
+                    data.Add(userid, Points.MatchLoss);
+                    data.Add(userid, Points.MatchLossSeed);
+                    break;
+                case Points.MatchDeath:
+                    data.Add(userid, Points.MatchDeath);
+                    data.Add(userid, Points.MatchDeathSeed); 
+                    break;
+                case Points.MatchKill:
+                    data.Add(userid, Points.MatchKill);
+                    data.Add(userid, Points.MatchKillSeed);
+                    break;
+            }
+        }
+
+        #region Facepunch TOS Compliance
+
+        private readonly HashSet<int> _dlcItemIds = new();
+        private readonly HashSet<ulong> _ownershipIds = new();
+        private bool _ownershipReady;
+
+        private void LoadOwnership()
+        {
+            if (!config.BlockPaidContent)
+            {
+                _ownershipReady = true;
+                return;
+            }
+
+            if ((Steamworks.SteamInventory.Definitions?.Length ?? 0) == 0)
+            {
+                timer.In(3f, LoadOwnership);
+                return;
+            }
+
+            foreach (var def in ItemManager.GetItemDefinitions())
+            {
+                if (RequiresOwnership(def))
                 {
-                    dataRequests.Remove(entry.Key);
+                    _dlcItemIds.Add(def.itemid);
+                }
+
+                if (def.skins != null)
+                {
+                    foreach (var sk in def.skins)
+                    {
+                        if (sk.id != 0) _ownershipIds.Add((ulong)sk.id);
+                    }
+                }
+
+                if (def.skins2 != null)
+                {
+                    foreach (var sk2 in def.skins2)
+                    {
+                        if (sk2.WorkshopId != 0) _ownershipIds.Add(sk2.WorkshopId);
+                    }
+                }
+            }
+
+            _ownershipReady = true;
+        }
+
+        public bool RequiresOwnership(ItemDefinition def, ulong skin)
+        {
+            if (!config.BlockPaidContent) return false;
+            if (skin != 0uL && !_ownershipReady) return true;
+            if (skin != 0uL && _ownershipIds.Contains(skin)) return true;
+            if (def != null && !_ownershipReady) return RequiresOwnership(def);
+            return def != null && _dlcItemIds.Contains(def.itemid);
+        }
+
+        public bool RequiresOwnership(ItemDefinition def) => def switch
+        {
+            null => false,
+            { steamItem: { id: not 0 } } => true,
+            { steamDlc: { dlcAppID: not 0 } } => true,
+            { Blueprint: { NeedsSteamDLC: true } } => true,
+            { Parent: { Blueprint: { NeedsSteamDLC: true } } } => true,
+            { isRedirectOf: { Blueprint: { NeedsSteamDLC: true } } } => true,
+            { isRedirectOf: not null } => true,
+            _ => false
+        };
+
+        #endregion Facepunch TOS Compliance
+
+        #region Networking
+
+        private Dictionary<ulong, VanishedPlayer> VanishedPlayers = new();
+        private Dictionary<ulong, VanishedWatcher> VanishedWatchers = new();
+
+        public class VanishedPlayer
+        {
+            public Vector3 lastPosition;
+            public BasePlayer target;
+            public Transform t;
+            public bool HasMoved()
+            {
+                if (t != null && lastPosition != t.position)
+                {
+                    lastPosition = t.position;
+                    return true;
+                }
+                return false;
+            }
+        }
+
+        public class VanishedWatcher
+        {
+            public Duelist env;
+            public Timer Update;
+            public ulong userid;
+            public BasePlayer target;
+            public bool IsConnected => target != null && target.IsConnected;
+            public void SendQueueUpdate()
+            {
+                if (!IsConnected)
+                {
+                    TryUnsubscribeCanNetworkTo();
+                    return;
+                }
+                if (env.VanishedPlayers.Count > 0 && target.CanInteract() && !target.IsSpectating())
+                {
+                    foreach (var vp in env.VanishedPlayers.Values)
+                    {
+                        if (vp.target == target || !vp.HasMoved())
+                        {
+                            continue;
+                        }
+                        target.QueueUpdate(BasePlayer.NetworkQueue.Update, vp.target);
+                    }
+                }
+            }
+            public void TryUnsubscribeCanNetworkTo()
+            {
+                using var watchers = GetPooledList(env.VanishedWatchers);
+                foreach (var watcher in watchers)
+                {
+                    if (!watcher.Value.IsConnected)
+                    {
+                        if (watcher.Value.Update != null)
+                        {
+                            watcher.Value.Update.Destroy();
+                        }
+                        env.VanishedWatchers.Remove(watcher.Key);
+                    }
+                }
+                if (env.VanishedWatchers.Count == 0)
+                {
+                    env.Unsubscribe(nameof(CanNetworkTo));
+                }
+            }
+            public void EntityDestroyOnClient()
+            {
+                foreach (var vp in env.VanishedPlayers.Values)
+                {
+                    if (vp.target.IsValid() && vp.target != target)
+                    {
+                        vp.target.DestroyOnClient(target.Connection);
+                    }
+                }
+            }
+            public void SendShouldNetworkToUpdateImmediate()
+            {
+                foreach (var vp in env.VanishedPlayers.Values)
+                {
+                    if (vp.target.IsValid())
+                    {
+                        vp.target.SendNetworkUpdateImmediate();
+                    }
                 }
             }
         }
 
-        private void UpdateMatchSizeStats(string playerId, bool winner, bool loser, int teamSize)
+        private object CanNetworkTo(BasePlayer player, BasePlayer target)
         {
-            string key = teamSize.ToString();
+            if (player == null || target == null || player == target) // 0.1.3 fix: check if player is null
+                return null;
 
-            if (winner)
+            if (DuelTerritory(player.transform.position))
             {
-                duelsData.MatchSizesVictoriesSeed.TryAdd(key, new());
-                duelsData.MatchSizesVictories.TryAdd(key, new());
+                if (visibleToAdmins && target.IsAdmin && !IsParticipant(target.UserIDString))
+                    return true;
 
-                if (!duelsData.MatchSizesVictoriesSeed[key].TryAdd(playerId, 1))
-                    duelsData.MatchSizesVictoriesSeed[key][playerId]++;
-                if (!duelsData.MatchSizesVictories[key].TryAdd(playerId, 1))
-                    duelsData.MatchSizesVictories[key][playerId]++;
+                if (_duelists.TryGetValue(player.UserIDString, out var val)) // 1v1 check
+                    return val.ID == target.UserIDString;
+
+                if (spectators.Contains(player.UserIDString)) // spectator check
+                    return spectators.Contains(target.UserIDString);
+
+                if (InDeathmatch(player)) // tdm check
+                    return InDeathmatch(target);
             }
 
-            if (loser)
-            {
-                duelsData.MatchSizesLossesSeed.TryAdd(key, new());
-                duelsData.MatchSizesLosses.TryAdd(key, new());
+            return null;
+        }
 
-                if (!duelsData.MatchSizesLossesSeed[key].TryAdd(playerId, 1))
-                    duelsData.MatchSizesLossesSeed[key][playerId]++;
-                if (!duelsData.MatchSizesLosses[key].TryAdd(playerId, 1))
-                    duelsData.MatchSizesLosses[key][playerId]++;
+        //private object CanNetworkTo(HeldEntity heldEntity, BasePlayer target)
+        //{
+        //    if (heldEntity == null)
+        //        return null;
+        //    BasePlayer player = heldEntity.GetOwnerPlayer();
+        //    if (player == null)
+        //        return null;
+        //    return CanNetworkTo(player, target); // 0.1.3 fix: check if player is null
+        //}
+
+        public void Disappear(BasePlayer player)
+        {
+            if (VanishedPlayers.ContainsKey(player.userID))
+                return;
+            VanishedPlayers[player.userID] = new()
+            {
+                target = player,
+                t = player.transform
+            };
+            //player.syncPosition = false;
+            player.limitNetworking = true;
+            VanishedWatcher vw = null;
+            VanishedWatchers[player.userID] = vw = new()
+            {
+                env = this,
+                target = player,
+                userid = player.userID,
+                Update = timer.Every(0.1f, () => vw.SendQueueUpdate())
+            };
+            if (VanishedWatchers.Count == 1)
+            {
+                Subscribe(nameof(CanNetworkTo));
+            }
+            vw.SendShouldNetworkToUpdateImmediate();
+            HolsterWeapon(player);
+        }
+
+        public void Reappear(BasePlayer player)
+        {
+            if (VanishedWatchers.Remove(player.userID, out var vw))
+            {
+                vw.Update.Destroy();
+                vw.EntityDestroyOnClient();
+                vw.TryUnsubscribeCanNetworkTo();
+            }
+            if (VanishedPlayers.Remove(player.userID))
+            {
+                //player.syncPosition = true;
+                player.limitNetworking = false;
             }
         }
 
-        private void UpdateMatchStats(string playerId, bool winner, bool loser, bool death, bool kill)
-        {
-            if (winner)
-            {
-                if (!duelsData.MatchVictories.ContainsKey(playerId)) duelsData.MatchVictories.Add(playerId, 1);
-                else duelsData.MatchVictories[playerId]++;
-                if (!duelsData.MatchVictoriesSeed.ContainsKey(playerId)) duelsData.MatchVictoriesSeed.Add(playerId, 1);
-                else duelsData.MatchVictoriesSeed[playerId]++;
-            }
-            if (loser)
-            {
-                if (!duelsData.MatchLosses.ContainsKey(playerId)) duelsData.MatchLosses.Add(playerId, 1);
-                else duelsData.MatchLosses[playerId]++;
-                if (!duelsData.MatchLossesSeed.ContainsKey(playerId)) duelsData.MatchLossesSeed.Add(playerId, 1);
-                else duelsData.MatchLossesSeed[playerId]++;
-            }
-            if (death)
-            {
-                if (!duelsData.MatchDeaths.ContainsKey(playerId)) duelsData.MatchDeaths.Add(playerId, 1);
-                else duelsData.MatchDeaths[playerId]++;
-                if (!duelsData.MatchDeathsSeed.ContainsKey(playerId)) duelsData.MatchDeathsSeed.Add(playerId, 1);
-                else duelsData.MatchDeathsSeed[playerId]++;
-            }
-            if (kill)
-            {
-                if (!duelsData.MatchKills.ContainsKey(playerId)) duelsData.MatchKills.Add(playerId, 1);
-                else duelsData.MatchKills[playerId]++;
-                if (!duelsData.MatchKillsSeed.ContainsKey(playerId)) duelsData.MatchKillsSeed.Add(playerId, 1);
-                else duelsData.MatchKillsSeed[playerId]++;
-            }
-        }
+        //private void InitializeNetworking()
+        //{
+        //    using var targets = GetPlayerList();
+        //    foreach (var target in targets)
+        //    {
+        //        if (target.limitNetworking)
+        //        {
+        //            OnVanishDisappear(target);
+        //        }
+        //    }
+        //}
+
+        //private void EntityDestroyOnClient()
+        //{
+        //    foreach (var vw in VanishedWatchers.Values)
+        //    {
+        //        if (vw.IsConnected)
+        //        {
+        //            vw.EntityDestroyOnClient();
+        //        }
+        //    }
+        //}
+
+        //public void EntityDestroyOnClient(BasePlayer player)
+        //{
+        //    foreach (var vp in VanishedPlayers.Values)
+        //    {
+        //        if (vp.target.IsValid() && vp.target != player)
+        //        {
+        //            vp.target.DestroyOnClient(player.Connection);
+        //        }
+        //    }
+        //}
+
+        //private void OnVanishDisappear(BasePlayer player)
+        //{
+        //    VanishedPlayers[player.userID] = new()
+        //    {
+        //        target = player,
+        //        t = player.transform
+        //    };
+        //}
+
+        //private void OnVanishReappear(BasePlayer player)
+        //{
+        //    VanishedPlayers.Remove(player.userID);
+        //}
+
+        #endregion Networking
 
         #region SpawnPoints
 
         public void SendSpawnHelp(BasePlayer player)
         {
-            Message(player, msg("SpawnCount", player.UserIDString, duelsData.Spawns.Count));
-            Message(player, msg("SpawnAdd", player.UserIDString, szDuelChatCommand));
-            Message(player, msg("SpawnHere", player.UserIDString, szDuelChatCommand));
-            Message(player, msg("SpawnRemove", player.UserIDString, szDuelChatCommand, spRemoveOneMaxDistance));
-            Message(player, msg("SpawnRemoveAll", player.UserIDString, szDuelChatCommand, spRemoveAllMaxDistance));
-            Message(player, msg("SpawnWipe", player.UserIDString, szDuelChatCommand));
+            Message(player, "SpawnCount", data.Spawns.Count);
+            Message(player, "SpawnAdd", szDuelChatCommand);
+            Message(player, "SpawnHere", szDuelChatCommand);
+            Message(player, "SpawnRemove", szDuelChatCommand, spRemoveOneMaxDistance);
+            Message(player, "SpawnRemoveAll", szDuelChatCommand, spRemoveAllMaxDistance);
+            Message(player, "SpawnWipe", szDuelChatCommand);
         }
 
         public void AddSpawnPoint(BasePlayer player, bool useHit)
@@ -6713,22 +8153,24 @@ namespace Oxide.Plugins
             {
                 if (!Physics.Raycast(player.eyes.HeadRay(), out var hit, Mathf.Infinity, wallMask))
                 {
-                    Message(player, msg("FailedRaycast", player.UserIDString));
+                    Message(player, "FailedRaycast");
                     return;
                 }
 
                 spawn = hit.point;
             }
 
-            if (duelsData.Spawns.Contains(spawn.ToString()))
+            spawn = spawn.SnapTo(0.001f);
+            if (data.Spawns.Contains(spawn))
             {
-                Message(player, msg("SpawnExists", player.UserIDString));
+                Message(player, "SpawnExists");
                 return;
             }
 
-            duelsData.Spawns.Add(spawn.ToString());
+            data.Spawns.Add(spawn);
             player.SendConsoleCommand("ddraw.text", spDrawTime, Color.green, spawn, "+S");
-            Message(player, msg("SpawnAdded", player.UserIDString, FormatPosition(spawn)));
+            Message(player, "SpawnAdded", FormatPosition(spawn));
+            ClearSpawns(spawn);
         }
 
         public void RemoveSpawnPoint(BasePlayer player)
@@ -6737,94 +8179,93 @@ namespace Oxide.Plugins
             var spawn = Vector3.zero;
             float dist = radius;
 
-            using var spawns = GetPool(duelsData.Spawns);
-            foreach (var entry in spawns)
+            foreach (var s in data.Spawns)
             {
-                var _spawn = entry.ToVector3();
-                float distance = Vector3.Distance(player.transform.position, _spawn);
+                float distance = Vector3.Distance(player.transform.position, s);
 
                 if (distance < dist)
                 {
                     dist = distance;
-                    spawn = _spawn;
+                    spawn = s;
                 }
             }
 
             if (spawn != Vector3.zero)
             {
-                duelsData.Spawns.Remove(spawn.ToString());
+                data.Spawns.Remove(spawn);
                 player.SendConsoleCommand("ddraw.text", spDrawTime, Color.red, spawn, "-S");
-                Message(player, msg("SpawnRemoved", player.UserIDString, 1));
+                Message(player, "SpawnRemoved", 1);
+                ClearSpawns(spawn);
             }
-            else
-                Message(player, msg("SpawnNoneFound", player.UserIDString, radius));
+            else Message(player, "SpawnNoneFound", radius);
         }
 
         public void RemoveSpawnPoints(BasePlayer player)
         {
             int count = 0;
-
-            using var spawns = GetPool(duelsData.Spawns);
-            foreach (var entry in spawns)
+            using var spawns = GetPooledList(data.Spawns);
+            foreach (var spawn in spawns)
             {
-                var spawn = entry.ToVector3();
-
                 if (Vector3.Distance(player.transform.position, spawn) <= spRemoveAllMaxDistance)
                 {
                     count++;
-                    duelsData.Spawns.Remove(entry);
+                    data.Spawns.Remove(spawn);
+                    ClearSpawns(spawn);
                     player.SendConsoleCommand("ddraw.text", spDrawTime, Color.red, spawn, "-S");
                 }
             }
 
             if (count == 0)
-                Message(player, msg("SpawnNoneFound", player.UserIDString, spRemoveAllMaxDistance));
-            else
-                Message(player, msg("SpawnRemoved", player.UserIDString, count));
+            {
+                Message(player, "SpawnNoneFound", spRemoveAllMaxDistance);
+            }
+            else Message(player, "SpawnRemoved", count);
+        }
+
+        public void ClearSpawns(Vector3 spawn)
+        {
+            foreach (var zone in duelingZones)
+            {
+                if (zone.SqrDistance(spawn) <= zone.SqrProtectionRadius)
+                {
+                    zone.ClearSpawns();
+                }
+            }
         }
 
         public void WipeSpawnPoints(BasePlayer player)
         {
-            if (duelsData.Spawns.Count == 0)
+            if (data.Spawns.Count == 0)
             {
-                Message(player, msg("SpawnNoneExist", player.UserIDString));
+                Message(player, "SpawnNoneExist");
                 return;
             }
 
-            foreach (var spawn in duelsData.Spawns.Select(spawn => spawn.ToVector3()))
+            foreach (var spawn in data.Spawns)
                 player.SendConsoleCommand("ddraw.text", 30f, Color.red, spawn, "-S");
 
-            int amount = duelsData.Spawns.Count;
-            duelsData.Spawns.Clear();
-            Message(player, msg("SpawnWiped", player.UserIDString, amount));
+            int amount = data.Spawns.Count;
+            data.Spawns.Clear();
+            Message(player, "SpawnWiped", amount);
         }
 
         public List<Vector3> GetSpawnPoints(DuelingZone zone)
         {
-            return new(duelsData.Spawns.Select(entry => entry.ToVector3()).Where(spawn => zone.Distance(spawn) < zone.ProtectionRadius));
-        }
-
-        public string FormatBone(string source)
-        {
-            if (string.IsNullOrEmpty(source))
-                return "Chest";
-
-            foreach (var entry in boneTags)
-                source = source.Replace(entry.Key, entry.Value);
-
-            return string.Join(" ", source.Split(' ').Select(str => str.SentenceCase()));
+            var spawns = new List<Vector3>();
+            foreach (var spawn in data.Spawns)
+            {
+                if (zone.SqrDistance(spawn) <= zone.SqrProtectionRadius)
+                    spawns.Add(spawn);
+            }
+            return spawns;
         }
 
         public string FormatPosition(Vector3 position)
         {
-            string x = position.x.ToString("N2");
-            string y = position.y.ToString("N2");
-            string z = position.z.ToString("N2");
-
-            return $"{x} {y} {z}";
+            return $"{position.x:N2} {position.y:N2} {position.z:N2}";
         }
 
-        #endregion
+        #endregion SpawnPoints
 
         #region UI Creation 
 
@@ -6837,45 +8278,45 @@ namespace Oxide.Plugins
         private void ccmdDuelistUI(ConsoleSystem.Arg arg)
         {
             var player = arg.Player();
-
-            if (IsNull(player) || !arg.HasArgs())
+            if (IsNotConnected(player) || !arg.HasArgs())
                 return;
 
+            var user = player.IPlayer;
             switch (arg.Args[0].ToLower())
             {
                 case "accept":
                     {
-                        if (dataRequests.ContainsValue(player.UserIDString))
+                        if (HasPendingRequest(player.UserIDString))
                         {
-                            cmdDuel(player, szDuelChatCommand, new[] { "accept" });
+                            CommandDuelist(user, szDuelChatCommand, new[] { "accept" });
                             break;
                         }
-                        if (tdmRequests.ContainsValue(player.UserIDString))
+                        if (HasRequestSender(player))
                         {
-                            cmdTDM(player, szMatchChatCommand, new[] { "accept" });
+                            CommandDeathmatch(user, szMatchChatCommand, new[] { "accept" });
                             break;
                         }
 
-                        Message(player, msg("NoPendingRequests2", player.UserIDString));
+                        Message(player, "NoPendingRequests2");
                         break;
                     }
                 case "decline":
                     {
-                        if (dataRequests.ContainsKey(player.UserIDString) || dataRequests.ContainsValue(player.UserIDString))
+                        if (HasRequest(player.UserIDString))
                         {
-                            cmdDuel(player, szDuelChatCommand, new[] { "decline" });
+                            CommandDuelist(user, szDuelChatCommand, new[] { "decline" });
                             break;
                         }
 
                         var deathmatch = tdmMatches.FirstOrDefault(x => x.GetTeam(player) != Team.None);
 
-                        if (deathmatch != null || tdmRequests.ContainsValue(player.UserIDString) || tdmRequests.ContainsKey(player.UserIDString))
+                        if (deathmatch != null || HasRequestTarget(player) || HasRequestSender(player))
                         {
-                            cmdTDM(player, szMatchChatCommand, new[] { "decline" });
+                            CommandDeathmatch(user, szMatchChatCommand, new[] { "decline" });
                             break;
                         }
 
-                        Message(player, msg("NoPendingRequests", player.UserIDString));
+                        Message(player, "NoPendingRequests");
                         break;
                     }
                 case "closeui":
@@ -6890,12 +8331,12 @@ namespace Oxide.Plugins
                     }
                 case "public":
                     {
-                        cmdTDM(player, szMatchChatCommand, new[] { "public" });
+                        CommandDeathmatch(user, szMatchChatCommand, new[] { "public" });
                         break;
                     }
                 case "requeue":
                     {
-                        if (IsDueling(player) || InDeathmatch(player))
+                        if (InEvent(player))
                             return;
 
                         if (sendHomeRequeue)
@@ -6904,23 +8345,20 @@ namespace Oxide.Plugins
                             SendHome(player);
                         }
                         else CreateDefeatUI(player);
-                        cmdQueue(player, szQueueChatCommand, new string[0]);
+                        CommandQueue(user, szQueueChatCommand, new string[0]);
                         return;
                     }
                 case "queue":
                     {
-                        if (IsDueling(player) || InDeathmatch(player))
+                        if (InEvent(player))
                             break;
 
-                        cmdQueue(player, szQueueChatCommand, new string[0]);
+                        CommandQueue(user, szQueueChatCommand, new string[0]);
                         break;
                     }
                 case "respawn":
                     {
-                        CuiHelper.DestroyUi(player, "DuelistUI_Defeat");
-
-                        if (!InEvent(player) && DuelTerritory(player.transform.position))
-                            SendHome(player);
+                        LeaveEvent(player);
 
                         return;
                     }
@@ -6948,30 +8386,28 @@ namespace Oxide.Plugins
                         if (arg.Args.Length != 2)
                             return;
 
-                        var match = GetMatch(player);
-
-                        if (match != null && match.IsHost(player))
+                        if (GetDeathmatch(player, out var match) && match.IsHost(player))
                         {
                             if (!match.IsStarted)
-                                match.Kit = GetVerifiedKit(arg.Args[1]);
+                                match.Kit = GetVerifiedKit(arg.Args[1]); // UI
 
                             break;
                         }
 
-                        if (duelsData.CustomKits.ContainsKey(player.UserIDString) && duelsData.CustomKits[player.UserIDString] == arg.Args[1])
+                        if (data.CustomKits.ContainsKey(player.UserIDString) && data.CustomKits[player.UserIDString] == arg.Args[1])
                         {
-                            duelsData.CustomKits.Remove(player.UserIDString);
-                            Message(player, msg("ResetKit", player.UserIDString));
+                            data.CustomKits.Remove(player.UserIDString);
+                            Message(player, "ResetKit");
                             break;
                         }
 
-                        string kit = GetVerifiedKit(arg.Args[1]);
+                        string kit = GetVerifiedKit(arg.Args[1].Replace("||", " ")); // UI
 
                         if (string.IsNullOrEmpty(kit))
                             break;
 
-                        duelsData.CustomKits[player.UserIDString] = kit;
-                        Message(player, msg("KitSet", player.UserIDString, kit));
+                        data.CustomKits[player.UserIDString] = kit;
+                        Message(player, "KitSet", kit);
                         break;
                     }
                 case "joinmatch":
@@ -6982,9 +8418,7 @@ namespace Oxide.Plugins
                         if (IsDueling(player))
                             break;
 
-                        var match = GetMatch(player);
-
-                        if (match != null)
+                        if (GetDeathmatch(player, out var match))
                         {
                             if (match.IsStarted)
                                 break;
@@ -6996,7 +8430,7 @@ namespace Oxide.Plugins
 
                         if (newMatch == null || newMatch.IsFull() || newMatch.IsStarted || newMatch.IsOver)
                         {
-                            Message(player, msg("MatchNoLongerValid", player.UserIDString));
+                            Message(player, "MatchNoLongerValid");
                             break;
                         }
 
@@ -7018,12 +8452,12 @@ namespace Oxide.Plugins
                         if (arg.Args.Length != 2 || !arg.Args[1].All(char.IsDigit))
                             break;
 
-                        cmdTDM(player, szMatchChatCommand, new[] { "size", arg.Args[1] });
+                        CommandDeathmatch(user, szMatchChatCommand, new[] { "size", arg.Args[1] });
                         break;
                     }
                 case "any":
                     {
-                        cmdTDM(player, szMatchChatCommand, new[] { "any" });
+                        CommandDeathmatch(user, szMatchChatCommand, new[] { "any" });
                         break;
                     }
             }
@@ -7033,9 +8467,10 @@ namespace Oxide.Plugins
 
         public void DestroyAllUI()
         {
-            foreach (var player in BasePlayer.activePlayerList)
+            using var targets = GetPlayerList();
+            foreach (var target in targets)
             {
-                DestroyUI(player);
+                DestroyUI(target);
             }
         }
 
@@ -7048,19 +8483,12 @@ namespace Oxide.Plugins
             CuiHelper.DestroyUi(player, "DuelistUI_Defeat");
             CuiHelper.DestroyUi(player, "DuelistUI_Countdown");
 
-            if (readyUiList.Contains(player.UserIDString))
+            if (readyUiList.Remove(player.UserIDString))
             {
                 CuiHelper.DestroyUi(player, "DuelistUI_Ready");
-                readyUiList.Remove(player.UserIDString);
             }
 
-            if (duelistUI.Contains(player.UserIDString))
-            {
-                duelistUI.Remove(player.UserIDString);
-                return true;
-            }
-
-            return false;
+            return duelistUI.Remove(player.UserIDString);
         }
 
         public void ccmdDUI(ConsoleSystem.Arg arg)
@@ -7104,9 +8532,14 @@ namespace Oxide.Plugins
                 "UI_Public",
                 "UI_Queue",
                 "UI_TDM",
-                "UI_Any",
-                duelsData.AutoReady.Contains(player.UserIDString) ? "UI_ReadyOn" : "UI_ReadyOff",
+                "UI_Any"
             };
+
+            if (!autoReady)
+            {
+                buttons.Add(data.AutoReady.Contains(player.UserIDString) ? "UI_ReadyOn" : "UI_ReadyOff");
+            }
+
             var element = UI.CreateElementContainer("DuelistUI_Options", "0 0 0 0.5", "0.915 0.148", "0.981 0.441", guiUseCursor);
 
             if (guiUseCloseButton)
@@ -7158,7 +8591,7 @@ namespace Oxide.Plugins
             }
 
             var element = UI.CreateElementContainer("DuelistUI_Matches", "0 0 0 0.5", "0.669 0.148", "0.903 0.541");
-            using var matches = GetPool(tdmMatches.Where(x => x.IsPublic && !x.IsStarted && !x.IsFull()));
+            using var matches = GetPooledList(tdmMatches.Where(x => x.IsPublic && !x.IsStarted && !x.IsFull()));
 
             for (int number = 0; number < matches.Count; number++)
             {
@@ -7166,7 +8599,7 @@ namespace Oxide.Plugins
                 UI.CreateButton(ref element, "DuelistUI_Matches", "0.29 0.49 0.69 0.5", matches[number].Versus, 12, $"{pos[0]} {pos[1]}", $"{pos[2]} {pos[3]}", $"UI_DuelistCommand joinmatch {matches[number].Id}");
             }
 
-            var match = GetMatch(player);
+            GetDeathmatch(player, out var match);
             string teamSize = msg("UI_TeamSize", player.UserIDString);
 
             for (int size = Math.Max(2, minDeathmatchSize); size < maxDeathmatchSize + 1; size++)
@@ -7200,12 +8633,12 @@ namespace Oxide.Plugins
 
             var element = UI.CreateElementContainer("DuelistUI_Kits", "0 0 0 0.5", "0.669 0.148", "0.903 0.541");
             var kits = VerifiedKits;
-            string kit = duelsData.CustomKits.ContainsKey(player.UserIDString) ? duelsData.CustomKits[player.UserIDString] : null;
+            string kit = data.CustomKits.ContainsKey(player.UserIDString) ? data.CustomKits[player.UserIDString] : null;
 
             for (int number = 0; number < kits.Count; number++)
             {
                 var pos = UI.CalcButtonPos(number);
-                UI.CreateButton(ref element, "DuelistUI_Kits", kits[number] == kit ? "0.69 0.49 0.29 0.5" : "0.29 0.49 0.69 0.5", kits[number], 12, $"{pos[0]} {pos[1]}", $"{pos[2]} {pos[3]}", $"UI_DuelistCommand kit {kits[number]}");
+                UI.CreateButton(ref element, "DuelistUI_Kits", kits[number] == kit ? "0.69 0.49 0.29 0.5" : "0.29 0.49 0.69 0.5", kits[number], 12, $"{pos[0]} {pos[1]}", $"{pos[2]} {pos[3]}", $"UI_DuelistCommand kit {kits[number].Replace(" ", "||")}");
             }
 
             CuiHelper.AddUi(player, element);
@@ -7226,18 +8659,18 @@ namespace Oxide.Plugins
             timer.Once(guiAnnounceUITime, () => CuiHelper.DestroyUi(player, "DuelistUI_Announcement"));
         }
 
-        public void CreateCountdownUI(BasePlayer player, string text)
+        public void CreateCountdownUI(BasePlayer player, float countdown)
         {
             var element = UI.CreateElementContainer("DuelistUI_Countdown", "0 0 0 0.5", "0.484 0.92", "0.527 0.9643", false, "Hud");
 
-            UI.CreateLabel(ref element, "DuelistUI_Countdown", "1 0.1 0.1 1", text, 20, "0 0", "1 1");
+            UI.CreateLabel(ref element, "DuelistUI_Countdown", "1 0.1 0.1 1", countdown.ToString(), 20, "0 0", "1 1");
             CuiHelper.DestroyUi(player, "DuelistUI_Countdown");
             CuiHelper.AddUi(player, element);
         }
 
         public void ToggleReadyUI(BasePlayer player)
         {
-            if (IsNotConnected(player))
+            if (autoReady || IsNotConnected(player))
                 return;
 
             if (readyUiList.Contains(player.UserIDString))
@@ -7248,7 +8681,7 @@ namespace Oxide.Plugins
             }
 
             var element = UI.CreateElementContainer("DuelistUI_Ready", "0 0 0 0.5", "0.475 0.158", "0.573 0.21");
-            UI.CreateButton(ref element, "DuelistUI_Ready", "0.29 0.49 0.69 0.5", msg(duelsData.AutoReady.Contains(player.UserIDString) ? "UI_ReadyOn" : "UI_ReadyOff", player.UserIDString), 18, "0.016 0.081", "0.984 0.919", "UI_DuelistCommand ready");
+            UI.CreateButton(ref element, "DuelistUI_Ready", "0.29 0.49 0.69 0.5", msg(autoReady || data.AutoReady.Contains(player.UserIDString) ? "UI_ReadyOn" : "UI_ReadyOff", player.UserIDString), 18, "0.016 0.081", "0.984 0.919", "UI_DuelistCommand ready");
             CuiHelper.AddUi(player, element);
             readyUiList.Add(player.UserIDString);
         }
@@ -7262,7 +8695,7 @@ namespace Oxide.Plugins
 
             UI.CreateButton(ref element, "DuelistUI_Defeat", "0.29 0.49 0.69 0.5", msg("UI_Respawn", player.UserIDString), 18, "0.016 0.679", "0.984 0.976", "UI_DuelistCommand respawn");
             UI.CreateButton(ref element, "DuelistUI_Defeat", "0.29 0.49 0.69 0.5", msg("UI_Requeue", player.UserIDString), 18, "0.016 0.357", "0.984 0.655", "UI_DuelistCommand requeue");
-            UI.CreateButton(ref element, "DuelistUI_Defeat", "0.29 0.49 0.69 0.5", msg(duelsData.AutoReady.Contains(player.UserIDString) ? "UI_ReadyOn" : "UI_ReadyOff", player.UserIDString), 18, "0.016 0.024", "0.984 0.333", "UI_DuelistCommand ready");
+            if (!autoReady) UI.CreateButton(ref element, "DuelistUI_Defeat", "0.29 0.49 0.69 0.5", msg(autoReady || data.AutoReady.Contains(player.UserIDString) ? "UI_ReadyOn" : "UI_ReadyOff", player.UserIDString), 18, "0.016 0.024", "0.984 0.333", "UI_DuelistCommand ready");
             CuiHelper.DestroyUi(player, "DuelistUI_Defeat");
             CuiHelper.AddUi(player, element);
 
@@ -7280,7 +8713,7 @@ namespace Oxide.Plugins
 
             matchUpdateRequired = false;
 
-            using var matches = GetPool(matchesUI);
+            using var matches = GetPooledList(matchesUI);
             foreach (string userId in matches)
             {
                 matchesUI.Remove(userId);
@@ -7395,122 +8828,115 @@ namespace Oxide.Plugins
             }
         }
 
-        #endregion
+        #endregion UI Creation
 
         #region Config
 
-        private bool Changed;
-        private string szMatchChatCommand;
-        private string szDuelChatCommand;
-        private string szQueueChatCommand;
         private const string duelistPerm = "duelist.dd";
         private const string duelistGroup = "duelist";
-        private int deathTime;
-        private int immunityTime;
-        private int zoneCounter;
         private List<string> _hpDuelingKits = new();
         private List<string> _lpDuelingKits = new();
         private List<string> hpDuelingKits = new();
         private List<string> lpDuelingKits = new();
+        private Dictionary<string, List<DuelKitItem>> customKits => config.CustomKits.Kits;
+
+        private string szMatchChatCommand => config.Deathmatch.szMatchChatCommand;
+        private string szDuelChatCommand => config.Settings.szDuelChatCommand;
+        private string szQueueChatCommand => config.Settings.szQueueChatCommand;
+        private int deathTime => config.Settings.deathTime;
+        private int immunityTime => config.Settings.immunityTime;
+        private int zoneCounter => config.Zones.zoneCounter;
+        private List<BetInfo> cfg_duelingBets => config.Betting.Bets;
         private List<BetInfo> duelingBets = new();
-        private bool recordStats = true;
-        private int permsToGive = 3;
-        private float maxIncline;
-        private bool allowBetForfeit;
-        private bool allowBetRefund;
-        private bool allowBets;
-        private bool putToSleep;
-        private bool blockSpawning;
-        private bool killNpc;
-        private float announceTime;
-        private bool removePlayers;
-        private bool useAnnouncement;
-        private bool autoSetup;
-        private bool broadcastDefeat;
-        private double economicsMoney;
-        private double requiredDuelMoney;
-        private int serverRewardsPoints;
-        private float damageScaleAmount;
-        private int zoneAmount;
-        private int playersPerZone;
-        private bool visibleToAdmins;
-        private float spDrawTime;
-        private float spRemoveOneMaxDistance;
-        private float spRemoveAllMaxDistance;
-        private bool spAutoRemove;
-        private bool avoidWaterSpawns;
-        private int extraWallStacks;
-        private bool useZoneWalls;
-        private bool zoneUseWoodenWalls;
-        private float buildingBlockExtensionRadius;
-        private bool autoAllowAll;
-        private bool useRandomSkins;
-        private float playerHealth;
-        private bool dmFF;
-        private int minDeathmatchSize;
-        private int maxDeathmatchSize;
-        private bool autoEnable;
-        private ulong teamGoodShirt;
-        private ulong teamEvilShirt;
-        private string teamShirt;
-        private double teamEconomicsMoney;
-        private int teamServerRewardsPoints;
-        private float lesserKitChance;
-        private bool tdmEnabled;
-        private bool useLeastAmount;
-        private bool tdmServerDeaths;
-        private bool tdmMatchDeaths;
+        private bool recordStats => config.Ranked.recordStats;
+        private int permsToGive => config.Ranked.permsToGive;
+        private float maxIncline => config.Zones.maxIncline;
+        private bool allowBetForfeit => config.Betting.allowBetForfeit;
+        private bool allowBetRefund => config.Betting.allowBetRefund;
+        private bool allowBets => config.Betting.allowBets;
+        private bool putToSleep => config.Animals.putToSleep;
+        private bool blockSpawning => config.Settings.blockSpawning;
+        private bool killNpc => config.Animals.killNpc;
+        private float announceTime => config.Settings.announceTime;
+        private bool removePlayers => config.Settings.removePlayers;
+        private bool useAnnouncement => config.Settings.useAnnouncement;
+        private bool autoSetup => config.Settings.autoSetup;
+        private bool broadcastDefeat => config.Settings.broadcastDefeat;
+        private double economicsMoney => config.Rewards.economicsMoney;
+        private CustomCostOption requiredDuelPaymentOption => config.Rewards.requiredDuelPaymentOption;
+        private int serverRewardsPoints => config.Rewards.serverRewardsPoints;
+        private float damageScaleAmount => config.Settings.damageScaleAmount;
+        private int zoneAmount => config.Zones.zoneAmount;
+        private int playersPerZone => config.Zones.playersPerZone;
+        private bool visibleToAdmins => config.Zones.visibleToAdmins;
+        private float spDrawTime => config.Spawns.spDrawTime;
+        private float spRemoveOneMaxDistance => config.Spawns.spRemoveOneMaxDistance;
+        private float spRemoveAllMaxDistance => config.Spawns.spRemoveAllMaxDistance;
+        private bool spAutoRemove => config.Spawns.spAutoRemove;
+        private bool avoidWaterSpawns => config.Zones.avoidWaterSpawns;
+        private bool useInvisibility => config.Settings.useInvisibility;
+        private int extraWallStacks => config.Zones.extraWallStacks;
+        private bool useZoneWalls => config.Zones.useZoneWalls;
+        private bool zoneUseWoodenWalls => config.Zones.zoneUseWoodenWalls;
+        private float buildingBlockExtensionRadius => config.Settings.buildingBlockExtensionRadius;
+        private bool autoAllowAll => config.Settings.autoAllowAll;
+        private bool useRandomSkins => config.Settings.useRandomSkins;
+        private float playerHealth => config.Settings.playerHealth;
+        private bool dmFF => config.Deathmatch.dmFF;
+        private bool jitteredSpawns => config.Deathmatch.jitteredSpawns;
+        private int minDeathmatchSize => config.Deathmatch.minDeathmatchSize;
+        private int maxDeathmatchSize => config.Deathmatch.maxDeathmatchSize;
+        private bool autoEnable => config.Settings.autoEnable;
+        private ulong teamGoodShirt => config.Deathmatch.teamGoodShirt;
+        private ulong teamEvilShirt => config.Deathmatch.teamEvilShirt;
+        private string teamShirt => config.Deathmatch.teamShirt;
+        private double teamEconomicsMoney => config.Deathmatch.teamEconomicsMoney;
+        private int teamServerRewardsPoints => config.Deathmatch.teamServerRewardsPoints;
+        private float lesserKitChance => config.Settings.lesserKitChance;
+        private bool tdmEnabled => config.Deathmatch.tdmEnabled;
+        private bool useLeastAmount => config.Zones.useLeastAmount;
+        private bool tdmServerDeaths => config.Deathmatch.tdmServerDeaths;
+        private bool tdmMatchDeaths => config.Deathmatch.tdmMatchDeaths;
         private List<string> whitelistCommands = new();
-        private bool useWhitelistCommands;
-        private List<string> blacklistCommands = new();
-        private bool useBlacklistCommands;
-        private bool bypassNewmans;
-        private bool saveRestoreEnabled;
-        private List<DuelKitItem> respawnLoot = new();
-        private bool respawnDeadDisconnect;
-        private bool sendDeadHome;
-        private bool resetSeed;
-        private bool noStability;
-        private bool noMovement;
-        private bool requireTeamSize;
-        private int requiredMinSpawns;
-        private int requiredMaxSpawns;
-        private bool guiAutoEnable;
-        private bool guiUseCursor;
-        private string szUIChatCommand;
-        private bool useWorkshopSkins;
-        private bool respawnWalls;
-        private bool allowPlayerDeaths;
-        private bool morphBarricadesStoneWalls;
-        private bool morphBarricadesWoodenWalls;
-        private bool guiUseCloseButton;
-        private string autoKitName;
-        private float guiAnnounceUITime;
-        private bool sendDefeatedHome;
-        private bool sendHomeRequeue;
-        private bool sendHomeSpectatorWhenRematchTimesOut;
-        private bool autoFlames;
-        private bool autoOvens;
-        private bool autoTurrets;
-        private int sphereAmount;
-        private bool wipeDuelZones;
-        private bool setPlayerTime;
-        private ulong chatSteamID;
-        private float zoneRadius;
+        private bool useWhitelistCommands => config.Settings.useWhitelistCommands;
+        private List<string> blacklistCommands => config.Settings.blacklistCommands;
+        private bool useBlacklistCommands => config.Settings.useBlacklistCommands;
+        private bool bypassNewmans => config.Settings.bypassNewmans;
+        private List<string> IgnoredNakedShortnames => config.Settings.ignoredNakedItems;
+        private List<DuelKitItem> respawnLoot => config.Respawn.respawnLoot;
+        private bool respawnDeadDisconnect => config.Settings.respawnDeadDisconnect;
+        private bool sendDeadHome => config.Advanced.sendDeadHome;
+        private bool resetSeed => config.Settings.resetSeed;
+        private bool noStability => config.Settings.noStability;
+        private bool noMovement => config.Settings.noMovement;
+        private bool requireTeamSize => config.Advanced.requireTeamSize;
+        private int requiredMinSpawns => config.Advanced.requiredMinSpawns;
+        private int requiredMaxSpawns => config.Advanced.requiredMaxSpawns;
+        private bool guiAutoEnable => config.UserInterface.guiAutoEnable;
+        private bool guiUseCursor => config.UserInterface.guiUseCursor;
+        private string szUIChatCommand => config.UserInterface.szUIChatCommand;
+        private bool useWorkshopSkins => config.CustomKits.useWorkshopSkins;
+        private bool respawnWalls => config.Settings.respawnWalls;
+        private bool allowPlayerDeaths => config.Advanced.allowPlayerDeaths;
+        private bool morphBarricadesStoneWalls => config.Deployables.morphBarricadesStoneWalls;
+        private bool morphBarricadesWoodenWalls => config.Deployables.morphBarricadesWoodenWalls;
+        private bool guiUseCloseButton => config.UserInterface.guiUseCloseButton;
+        private string autoKitName => config.Respawn.autoKitName;
+        private float guiAnnounceUITime => config.UserInterface.guiAnnounceUITime;
+        private bool sendDefeatedHome => config.Advanced.sendDefeatedHome;
+        private bool sendHomeRequeue => config.UserInterface.sendHomeRequeue;
+        private bool sendHomeSpectatorWhenRematchTimesOut => config.Spectators.sendHomeSpectatorWhenRematchTimesOut;
+        private bool autoFlames => config.Devices.autoFlames;
+        private bool autoOvens => config.Devices.autoOvens;
+        private bool autoTurrets => config.Devices.autoTurrets;
+        private int sphereAmount => config.Settings.sphereAmount;
+        private bool wipeDuelZones => config.Settings.wipeDuelZones;
+        private bool setPlayerTime => config.Settings.setPlayerTime;
+        private ulong chatSteamID => config.Settings.chatSteamID;
+        private float zoneRadius => config.Zones.zoneRadius;
+        private bool autoReady => config.Settings.autoReady;
 
-        private List<object> RespawnLoot
-        {
-            get
-            {
-                return new List<object>
-                {
-                    new DuelKitItem(null, 1, "belt", null, "rock", 0, -1),
-                    new DuelKitItem(null, 1, "belt", null, "torch", 0, -1),
-                };
-            }
-        }
-
-        private List<object> BlacklistedCommands
+        private static List<string> BlacklistedCommands
         {
             get
             {
@@ -7528,7 +8954,7 @@ namespace Oxide.Plugins
             }
         }
 
-        private List<object> WhitelistedCommands
+        private static List<string> WhitelistedCommands
         {
             get
             {
@@ -7542,69 +8968,29 @@ namespace Oxide.Plugins
             }
         }
 
-        private List<object> DefaultBets
+        private static List<object> DefaultBets
         {
             get
             {
                 return new List<object>
                 {
-                    new Dictionary<string, object>
-                    {
-                        ["trigger"] = "stone",
-                        ["max"] = 50000,
-                        ["itemid"] = -2099697608
-                    },
-                    new Dictionary<string, object>
-                    {
-                        ["trigger"] = "sulfur",
-                        ["max"] = 50000,
-                        ["itemid"] = -1581843485
-                    },
-                    new Dictionary<string, object>
-                    {
-                        ["trigger"] = "fragment",
-                        ["max"] = 50000,
-                        ["itemid"] = 69511070
-                    },
-                    new Dictionary<string, object>
-                    {
-                        ["trigger"] = "charcoal",
-                        ["max"] = 50000,
-                        ["itemid"] = -1938052175
-                    },
-                    new Dictionary<string, object>
-                    {
-                        ["trigger"] = "gp",
-                        ["max"] = 25000,
-                        ["itemid"] = -265876753
-                    },
-                    new Dictionary<string, object>
-                    {
-                        ["trigger"] = "hqm",
-                        ["max"] = 1000,
-                        ["itemid"] = 317398316
-                    },
-                    new Dictionary<string, object>
-                    {
-                        ["trigger"] = "c4",
-                        ["max"] = 10,
-                        ["itemid"] = 1248356124
-                    },
-                    new Dictionary<string, object>
-                    {
-                        ["trigger"] = "rocket",
-                        ["max"] = 6,
-                        ["itemid"] = -742865266
-                    }
+                    new BetInfo(null, "stone", 50000, -2099697608),
+                    new BetInfo(null, "sulfur", 50000, -1581843485),
+                    new BetInfo(null, "fragment", 50000, 69511070),
+                    new BetInfo(null, "charcoal", 50000, -1938052175),
+                    new BetInfo(null, "gp", 25000, -265876753),
+                    new BetInfo(null, "hqm", 1000, 317398316),
+                    new BetInfo(null, "c4", 10, 1248356124),
+                    new BetInfo(null, "rocket", 6, -742865266),
                 };
             }
         }
 
-        private List<object> DefaultLesserKits
+        private static List<string> DefaultLesserKits
         {
             get
             {
-                return new()
+                return new List<string>
                 {
                     "kit_4",
                     "kit_5",
@@ -7613,91 +8999,15 @@ namespace Oxide.Plugins
             }
         }
 
-        private List<object> DefaultKits
+        private static List<string> DefaultKits
         {
             get
             {
-                return new()
+                return new List<string>
                 {
                     "kit_1",
                     "kit_2",
                     "kit_3"
-                };
-            }
-        }
-
-        private Dictionary<string, List<DuelKitItem>> customKits = new();
-
-        private Dictionary<string, object> DefaultCustomKits
-        {
-            get
-            {
-                return new()
-                {
-                    ["Hunting Bow"] = new List<object>
-                    {
-                        new DuelKitItem(null, 1, "belt", null, "bow.hunting", 0, -1),
-                        new DuelKitItem(null, 50, "belt", null, "arrow.wooden", 0, -1),
-                        new DuelKitItem(null, 1, "belt", null, "spear.stone", 0, -1),
-                        new DuelKitItem(null, 5, "belt", null, "bandage", 0, -1),
-                        new DuelKitItem(null, 5, "belt", null, "syringe.medical", 0, -1),
-                        new DuelKitItem(null, 5, "belt", null, "largemedkit", 0, -1),
-                        new DuelKitItem(null, 1, "wear", null, "burlap.gloves", 0, -1),
-                        new DuelKitItem(null, 1, "wear", null, "burlap.trousers", 0, -1),
-                        new DuelKitItem(null, 1, "wear", null, "burlap.shoes", 0, -1),
-                        new DuelKitItem(null, 1, "wear", null, "burlap.shirt", 0, -1),
-                        new DuelKitItem(null, 1, "wear", null, "burlap.headwrap", 0, -1),
-                    },
-                    ["Assault Rifle and Bolt Action Rifle"] = new List<object>
-                    {
-                        new DuelKitItem("ammo.rifle", 1, "belt", new() { "weapon.mod.lasersight" }, "rifle.ak", 0, -1),
-                        new DuelKitItem(null, 1, "belt", new() { "weapon.mod.lasersight", "weapon.mod.small.scope" }, "rifle.bolt", 0, -1),
-                        new DuelKitItem(null, 5, "belt", null, "bandage", 0, -1),
-                        new DuelKitItem(null, 5, "belt", null, "syringe.medical", 0, -1),
-                        new DuelKitItem(null, 5, "belt", null, "largemedkit", 0, -1),
-                        new DuelKitItem(null, 10, "belt", null, "bearmeat.cooked", 0, -1),
-                        new DuelKitItem(null, 1, "wear", null, "hoodie", 0, -1),
-                        new DuelKitItem(null, 1, "wear", null, "metal.facemask", 0, -1),
-                        new DuelKitItem(null, 1, "wear", null, "metal.plate.torso", 0, -1),
-                        new DuelKitItem(null, 1, "wear", null, "pants", 0, -1),
-                        new DuelKitItem(null, 1, "wear", null, "burlap.gloves", 0, -1),
-                        new DuelKitItem(null, 1, "wear", null, "shoes.boots", 0, -1),
-                        new DuelKitItem(null, 200, "main", null, "ammo.rifle", 0, -1),
-                        new DuelKitItem(null, 1, "main", null, "weapon.mod.flashlight", 0, -1),
-                        new DuelKitItem(null, 1, "main", null, "weapon.mod.small.scope", 0, -1),
-                    },
-                    ["Semi-Automatic Pistol"] = new List<object>
-                    {
-                        new DuelKitItem("ammo.pistol", 1, "belt", new() { "weapon.mod.lasersight" }, "pistol.semiauto", 0, -1),
-                        new DuelKitItem(null, 5, "belt", null, "bandage", 0, -1),
-                        new DuelKitItem(null, 5, "belt", null, "syringe.medical", 0, -1),
-                        new DuelKitItem(null, 5, "belt", null, "largemedkit", 0, -1),
-                        new DuelKitItem(null, 10, "belt", null, "bearmeat.cooked", 0, -1),
-                        new DuelKitItem(null, 1, "wear", null, "hoodie", 0, -1),
-                        new DuelKitItem(null, 1, "wear", null, "metal.facemask", 0, -1),
-                        new DuelKitItem(null, 1, "wear", null, "metal.plate.torso", 0, -1),
-                        new DuelKitItem(null, 1, "wear", null, "pants", 0, -1),
-                        new DuelKitItem(null, 1, "wear", null, "burlap.gloves", 0, -1),
-                        new DuelKitItem(null, 1, "wear", null, "shoes.boots", 0, -1),
-                        new DuelKitItem(null, 200, "main", null, "ammo.pistol", 0, -1),
-                        new DuelKitItem(null, 1, "main", null, "weapon.mod.flashlight", 0, -1),
-                    },
-                    ["Pump Shotgun"] = new List<object>
-                    {
-                        new DuelKitItem("ammo.shotgun.slug", 1, "belt", new() { "weapon.mod.lasersight" }, "shotgun.pump", 0, -1),
-                        new DuelKitItem(null, 5, "belt", null, "bandage", 0, -1),
-                        new DuelKitItem(null, 5, "belt", null, "syringe.medical", 0, -1),
-                        new DuelKitItem(null, 5, "belt", null, "largemedkit", 0, -1),
-                        new DuelKitItem(null, 10, "belt", null, "bearmeat.cooked", 0, -1),
-                        new DuelKitItem(null, 1, "wear", null, "hoodie", 0, -1),
-                        new DuelKitItem(null, 1, "wear", null, "metal.facemask", 0, -1),
-                        new DuelKitItem(null, 1, "wear", null, "metal.plate.torso", 0, -1),
-                        new DuelKitItem(null, 1, "wear", null, "pants", 0, -1),
-                        new DuelKitItem(null, 1, "wear", null, "burlap.gloves", 0, -1),
-                        new DuelKitItem(null, 1, "wear", null, "shoes.boots", 0, -1),
-                        new DuelKitItem(null, 200, "main", null, "ammo.shotgun.slug", 0, -1),
-                        new DuelKitItem(null, 1, "main", null, "weapon.mod.flashlight", 0, -1),
-                    }
                 };
             }
         }
@@ -7710,40 +9020,40 @@ namespace Oxide.Plugins
                 ["Granted"] = "Granted {0} ({1}) permission {2} for group {3}",
                 ["Logged"] = "Duelists have been logged to: {0}",
                 ["Indestructible"] = "This object belongs to the server and is indestructible!",
-                ["Building is blocked!"] = "<color=red>Building is blocked inside of dueling zones!</color>",
+                ["Building is blocked!"] = "<color=#FF0000>Building is blocked inside of dueling zones!</color>",
                 ["TopAll"] = "[ <color=#ffff00>Top Duelists Of All Time ({0})</color> ]:",
                 ["Top"] = "[ <color=#ffff00>Top Duelists ({0})</color> ]:",
                 ["NoLongerQueued"] = "You are no longer in queue for a duel.",
                 ["InQueueSuccess"] = "You are now in queue for a duel. You will teleport instantly when a match is available.",
-                ["MustBeNaked"] = "<color=red>You must be naked before you can duel.</color>",
+                ["MustBeNaked"] = "<color=#FF0000>You must be naked before you can duel.</color>",
                 ["AlreadyInADuel"] = "You cannot queue for a duel while already in a duel!",
-                ["MustAllowDuels"] = "You must allow duels first! Type: <color=orange>/{0} allow</color>",
+                ["MustAllowDuels"] = "You must allow duels first! Type: <color=#FFA500>/{0} allow</color>",
                 ["DuelsDisabled"] = "Duels are disabled.",
                 ["NoZoneExists"] = "No dueling zone exists.",
                 ["Banned"] = "You are banned from duels.",
                 ["FoundZone"] = "Took {0} tries ({1}ms) to get a dueling zone.",
                 ["ImmunityFaded"] = "Your immunity has faded.",
-                ["NotifyBetWon"] = "You have won your bet! To claim type <color=orange>/{0} claim</color>.",
+                ["NotifyBetWon"] = "You have won your bet! To claim type <color=#FFA500>/{0} claim</color>.",
                 ["ConsoleBetWon"] = "{0} ({1}) won his bet against {2} ({3})!",
-                ["DuelDeathMessage"] = "<color=silver><color=lime>{0}</color> (<color=lime>W</color>: <color=orange>{1}</color> / <color=red>L</color>: <color=orange>{2}</color>) has defeated <color=lime>{3}</color> (<color=lime>W</color>: <color=orange>{4}</color> / <color=red>L</color>: <color=orange>{5}</color>) in a duel with <color=green>{6}</color> health left.{7}</color>",
-                ["BetWon"] = " Bet won: <color=lime>{0}</color> (<color=lime>{1}</color>)",
-                ["ExecutionTime"] = "You have <color=red>{0} minutes</color> to win the duel before you are executed.",
+                ["DuelDeathMessage"] = "<color=#C0C0C0><color=#00FF00>{0}</color> (<color=#00FF00>W</color>: <color=#FFA500>{1}</color> / <color=#FF0000>L</color>: <color=#FFA500>{2}</color>) <color=#000000>→</color> <color=#00FF00>{3}</color> (<color=#00FF00>W</color>: <color=#FFA500>{4}</color> / <color=#FF0000>L</color>: <color=#FFA500>{5}</color>): 1v1 (<color=#00FF00>{6}</color> <color=#FFA500>HP</color>){7}</color>",
+                ["BetWon"] = " Bet won: <color=#00FF00>{0}</color> (<color=#00FF00>{1}</color>)",
+                ["ExecutionTime"] = "You have <color=#FF0000>{0} minutes</color> to win the duel before you are executed.",
                 ["FailedZone"] = "Failed to create a dueling zone, please try again.",
                 ["FailedSetup"] = "Failed to setup the zone, please try again.",
                 ["FailedRaycast"] = "Look towards the ground, and try again.",
                 ["BetPlaced"] = "Your bet {0} ({1}) has been placed.",
-                ["BetForfeitSuffix"] = " Type <color=orange>/{0} bet forfeit</color> to forfeit your bet.",
-                ["BetRefundSuffix"] = " Type <color=orange>/{0} bet refund</color> to refund your bet.",
+                ["BetForfeitSuffix"] = " Type <color=#FFA500>/{0} bet forfeit</color> to forfeit your bet.",
+                ["BetRefundSuffix"] = " Type <color=#FFA500>/{0} bet refund</color> to refund your bet.",
                 ["BetNotEnough"] = "Bet cancelled. You do not have enough to bet this amount!",
                 ["BetZero"] = "Bet cancelled. You do not have this item in your inventory.",
-                ["DuelAnnouncement"] = "Type <color=orange>/{duelChatCommand}</color> for information on the dueling system. See your standing on the leaderboard by using <color=orange>/{ladderCommand}</color>. Type <color=orange>/{queueCommand}</color> to enter the dueling queue now!",
-                ["DuelAnnouncementBetsSuffix"] = " Feeling lucky? Use <color=orange>/{0} bet</color> to create a bet!",
+                ["DuelAnnouncement"] = "Type <color=#FFA500>/{duelChatCommand}</color> for information on the dueling system. See your standing on the leaderboard by using <color=#FFA500>/{ladderCommand}</color>. Type <color=#FFA500>/{queueCommand}</color> to enter the dueling queue now!",
+                ["DuelAnnouncementBetsSuffix"] = " Feeling lucky? Use <color=#FFA500>/{0} bet</color> to create a bet!",
                 ["ZoneCreated"] = "Dueling zone created successfully.",
                 ["RemovedZone"] = "Removed dueling zone.",
                 ["RemovedBan"] = "Unbanned {0}",
                 ["AddedBan"] = "Banned {0}",
                 ["PlayerNotFound"] = "{0} not found. Try being more specific or use a steam id.",
-                ["RequestTimedOut"] = "Request timed out to duel <color=lime>{0}</color>",
+                ["RequestTimedOut"] = "Request timed out to duel <color=#00FF00>{0}</color>",
                 ["RemovedFromQueueRequest"] = "You have been removed from the dueling queue since you have requested to duel another player.",
                 ["RemovedFromDuel"] = "You have been removed from your duel.",
                 ["BetsDoNotMatch"] = "Your bet {0} ({1}) does not match {2} ({3})",
@@ -7753,9 +9063,9 @@ namespace Oxide.Plugins
                 ["MustHaveSameBet"] = "{0} is betting: {1} ({2}). You must have the same bet to duel this player.",
                 ["NoBetsToRefund"] = "There are no bets to refund.",
                 ["Disabled"] = "Disabled",
-                ["HelpDuelBet"] = "<color=silver><color=orange>/{0} bet</color> - place a bet towards your next duel.</color>",
-                ["HelpDuelAdmin"] = "<color=orange>Admin: /{0} on|off</color> - enable/disable duels",
-                ["HelpDuelAdminRefundAll"] = "<color=orange>Admin: /{0} bet refundall</color> - refund all bets for all players",
+                ["HelpDuelBet"] = "<color=#C0C0C0><color=#FFA500>/{0} bet</color> - place a bet towards your next duel.</color>",
+                ["HelpDuelAdmin"] = "<color=#FFA500>Admin: /{0} on|off</color> - enable/disable duels",
+                ["HelpDuelAdminRefundAll"] = "<color=#FFA500>Admin: /{0} bet refundall</color> - refund all bets for all players",
                 ["DuelsDisabledAlready"] = "Duels are already disabled!",
                 ["DuelsNowDisabled"] = "Duels disabled. Sending duelers home.",
                 ["DuelsEnabledAlready"] = "Duels are already enabled!",
@@ -7765,10 +9075,11 @@ namespace Oxide.Plugins
                 ["AllBetsClaimed"] = "You have claimed all of your bets.",
                 ["DuelChatOff"] = "You will no longer see duel death messages.",
                 ["DuelChatOn"] = "You will now see duel death messages.",
+                ["PlayerRequestsAuto"] = "There is no requirement to allow duels on this server!",
                 ["PlayerRequestsOn"] = "Players may now request to duel you. You will be removed from this list if you do not duel.",
                 ["PlayerRequestsOff"] = "Players may no longer request to duel you.",
-                ["BlockedRequestsFrom"] = "Blocked duel requests from: <color=lime>{0}</color>",
-                ["UnblockedRequestsFrom"] = "Removed block on duel requests from: <color=lime>{0}</color>",
+                ["BlockedRequestsFrom"] = "Blocked duel requests from: <color=#00FF00>{0}</color>",
+                ["UnblockedRequestsFrom"] = "Removed block on duel requests from: <color=#00FF00>{0}</color>",
                 ["AlreadyBlocked"] = "You have already blocked players from requesting duels.",
                 ["NoBetsConfigured"] = "No bets are configured.",
                 ["RefundAllPlayerNotice"] = "Server administrator has refunded your bet: {0} ({1})",
@@ -7786,29 +9097,29 @@ namespace Oxide.Plugins
                 ["CannotRefund"] = "You cannot refund bets on this server.",
                 ["BetRefunded"] = "You have refunded your bet.",
                 ["AlreadyBetting"] = "You are already betting! Your bet: {0} ({1})",
-                ["ToRefundUse"] = "To refund your bet, type: <color=orange>/{0} bet refund</color>",
-                ["ToForfeitUse"] = "To forfeit your bet, type: <color=orange>/{0} bet forfeit</color>. Refunds are not allowed.",
+                ["ToRefundUse"] = "To refund your bet, type: <color=#FFA500>/{0} bet refund</color>",
+                ["ToForfeitUse"] = "To forfeit your bet, type: <color=#FFA500>/{0} bet forfeit</color>. Refunds are not allowed.",
                 ["InvalidNumber"] = "Invalid number: {0}",
                 ["MultiplesOnly"] = "Number must be a multiple of 500. ie: 500, 1000, 2000, 5000, 10000, 15000",
                 ["NoRequestsReceived"] = "No players have requested a duel with you.",
-                ["DuelCancelledFor"] = "<color=lime>{0}</color> has cancelled the duel!",
+                ["DuelCancelledFor"] = "<color=#00FF00>{0}</color> has cancelled the duel!",
                 ["NoPendingRequests"] = "You have no pending request to cancel.",
-                ["DuelCancelledWith"] = "<color=lime>{0}</color> has cancelled the duel request.",
+                ["DuelCancelledWith"] = "<color=#00FF00>{0}</color> has cancelled the duel request.",
                 ["DuelCancelComplete"] = "Duel request cancelled.",
-                ["MustWaitToRequestAgain"] = "You must wait <color=red>{0} minute(s)</color> from the last time you requested a duel to request another.",
+                ["MustWaitToRequestAgain"] = "You must wait <color=#FF0000>{0} minute(s)</color> from the last time you requested a duel to request another.",
                 ["AlreadyDueling"] = "You are already dueling another player!",
                 ["CannotRequestThisPlayer"] = "You are not allowed to request duels with this player.",
-                ["TargetAlreadyDueling"] = "<color=lime>{0}</color> is already dueling another player!",
-                ["NotAllowedYet"] = "<color=lime>{0}</color> has not enabled duel requests yet. They must type <color=orange>/{1} allow</color>",
-                ["MustWaitForAccept"] = "You have requested a duel with <color=lime>{0}</color> already. You must wait for this player to accept the duel.",
+                ["TargetAlreadyDueling"] = "<color=#00FF00>{0}</color> is already dueling another player!",
+                ["NotAllowedYet"] = "<color=#00FF00>{0}</color> has not enabled duel requests yet. They must type <color=#FFA500>/{1} allow</color>",
+                ["MustWaitForAccept"] = "You have requested a duel with <color=#00FF00>{0}</color> already. You must wait for this player to accept the duel.",
                 ["PendingRequestAlready"] = "This player has a duel request pending already.",
-                ["TargetHasNoBet"] = "You have an active bet going. <color=lime>{0}</color> must have the same bet to duel you.",
+                ["TargetHasNoBet"] = "You have an active bet going. <color=#00FF00>{0}</color> must have the same bet to duel you.",
                 ["YourBet"] = "Your bet: {0} ({1})",
                 ["WoundedQueue"] = "You cannot duel while either player is wounded.",
-                ["DuelMustBeNaked"] = "Duel cancelled: <color=lime>{0}</color> inventory is not empty.",
-                ["LadderLife"] = "<color=#5A625B>Use <color=yellow>/{0} ladder life</color> to see all time stats</color>",
-                ["EconomicsDeposit"] = "You have received <color=yellow>${0}</color>!",
-                ["ServerRewardPoints"] = "You have received <color=yellow>{0} RP</color>!",
+                ["DuelMustBeNaked"] = "Duel cancelled: <color=#00FF00>{0}</color> inventory is not empty.",
+                ["LadderLife"] = "<color=#5A625B>Use <color=#FFFF00>/{0} ladder life</color> to see all time stats</color>",
+                ["EconomicsDeposit"] = "You have received <color=#FFFF00>${0}</color>!",
+                ["ServerRewardPoints"] = "You have received <color=#FFFF00>{0} RP</color>!",
                 ["DuelsMustBeEnabled"] = "Use '/{0} on' to enable dueling on the server.",
                 ["DataSaved"] = "Data has been saved.",
                 ["DuelsNowDisabledEmpty"] = "Duels disabled.",
@@ -7817,17 +9128,17 @@ namespace Oxide.Plugins
                 ["NoZoneFound"] = "No zone found. You must stand inside of the zone to remove it.",
                 ["RemovedZoneAt"] = "Removed zone at {0}",
                 ["CannotDuel"] = "You are not allowed to duel at the moment.",
-                ["LeftZone"] = "<color=red>You were found outside of the dueling zone while dueling. Your items have been removed.</color>",
-                ["SpawnAdd"] = "<color=orange>/{0} spawns add</color> - add a spawn point at the position you are looking at.",
-                ["SpawnHere"] = "<color=orange>/{0} spawns here</color> - add a spawn point at your position.",
-                ["SpawnRemove"] = "<color=orange>/{0} spawns remove</color> - removes the nearest spawn point within <color=orange>{1}m</color>.",
-                ["SpawnRemoveAll"] = "<color=orange>/{0} spawns removeall</color> - remove all spawn points within <color=orange>{1}m</color>.",
-                ["SpawnWipe"] = "<color=orange>/{0} spawns wipe</color> - wipe all spawn points.",
-                ["SpawnWiped"] = "<color=red>{0}</color> spawns points wiped.",
-                ["SpawnCount"] = "<color=green>{0}</color> spawn points in database.",
-                ["SpawnNoneFound"] = "No custom spawn points found within <color=orange>{0}m</color>.",
+                ["LeftZone"] = "<color=#FF0000>You were found outside of the dueling zone while dueling. Your items have been removed.</color>",
+                ["SpawnAdd"] = "<color=#FFA500>/{0} spawns add</color> - add a spawn point at the position you are looking at.",
+                ["SpawnHere"] = "<color=#FFA500>/{0} spawns here</color> - add a spawn point at your position.",
+                ["SpawnRemove"] = "<color=#FFA500>/{0} spawns remove</color> - removes the nearest spawn point within <color=#FFA500>{1}m</color>.",
+                ["SpawnRemoveAll"] = "<color=#FFA500>/{0} spawns removeall</color> - remove all spawn points within <color=#FFA500>{1}m</color>.",
+                ["SpawnWipe"] = "<color=#FFA500>/{0} spawns wipe</color> - wipe all spawn points.",
+                ["SpawnWiped"] = "<color=#FF0000>{0}</color> spawns points wiped.",
+                ["SpawnCount"] = "<color=#008000>{0}</color> spawn points in database.",
+                ["SpawnNoneFound"] = "No custom spawn points found within <color=#FFA500>{0}m</color>.",
                 ["SpawnAdded"] = "Spawn point added at {0}",
-                ["SpawnRemoved"] = "Removed <color=red>{0}</color> spawn(s)",
+                ["SpawnRemoved"] = "Removed <color=#FF0000>{0}</color> spawn(s)",
                 ["SpawnExists"] = "This spawn point exists already.",
                 ["SpawnNoneExist"] = "No spawn points exist.",
                 ["ZoneExists"] = "A dueling zone already exists here.",
@@ -7836,12 +9147,12 @@ namespace Oxide.Plugins
                 ["KitDoesntExist"] = "This kit doesn't exist: {0}",
                 ["KitSet"] = "Custom kit set to {0}. This kit will be used when both players have the same custom kit.",
                 ["KitsNotConfigured"] = "No kits have been configured for dueling.",
-                ["RemovedXWalls"] = "Removed {0} walls.",
                 ["SupportCreated"] = "{0} new dueling zones were created, however the total amount was not met. Please lower the radius, increase Maximum Incline On Hills, or reload the plugin to try again.",
                 ["SupportInvalidConfig"] = "Invalid zone radius detected in the configuration file for this map size. Please lower the radius, increase Maximum Incline On Hills, or reload the plugin to try again.",
-                ["WallSyntax"] = "Use <color=orange>/{0} walls [radius] <wood|stone></color>, or stand inside of an existing area with walls and use <color=orange>/{0} walls</color> to remove them.",
+                ["WallSyntax"] = "Use <color=#FFA500>/{0} walls [radius] <wood|stone></color>, or stand inside of an existing area with walls and use <color=#FFA500>/{0} walls</color> to remove them.",
                 ["GeneratedWalls"] = "Generated {0} arena walls {1} high at {2} in {3}ms",
                 ["ResetKit"] = "You are no longer using a custom kit.",
+                ["HelpQueueInteract"] = "You cannot queue while unable to interact!",
                 ["HelpDuels"] = "<color=#183a0e><size=18>DUELIST ({0})</size></color><color=#5A625B>\nDuel other players.</color>",
                 ["HelpAllow"] = "<color=#5A397A>/{0} allow</color><color=#5A625B> • Toggle requests for duels</color>",
                 ["HelpBlock"] = "<color=#5A397A>/{0} block <name></color><color=#5A625B> • Toggle block requests for a player</color>",
@@ -7856,25 +9167,26 @@ namespace Oxide.Plugins
                 ["NowDueling"] = "<color=#ff0000>You are now dueling <color=#00FF00>{0}</color>!</color>",
                 ["MoneyRequired"] = "Both players must be able to pay an entry fee of <color=#008000>${0}</color> to duel.",
                 ["CannotShop"] = "You are not allowed to shop while dueling.",
-                ["DuelRequestSent"] = "Sent request to duel <color=lime>{0}</color>. Request expires in 1 minute. Use <color=orange>/{1} cancel</color> to cancel this request.",
-                ["DuelRequestReceived"] = "<color=lime>{0}</color> has requested a duel. You have 1 minute to type <color=orange>/{1} accept</color> to accept the duel, or use <color=orange>/{1} decline</color> to decline immediately.",
+                ["DuelRequestSent"] = "Sent request to duel <color=#00FF00>{0}</color>. Request expires in 1 minute. Use <color=#FFA500>/{1} cancel</color> to cancel this request.",
+                ["DuelRequestReceived"] = "<color=#00FF00>{0}</color> has requested a duel. You have 1 minute to type <color=#FFA500>/{1} accept</color> to accept the duel, or use <color=#FFA500>/{1} decline</color> to decline immediately.",
                 ["MatchQueued"] = "You have entered the deathmatch queue. The match will start when a dueling zone becomes available.",
                 ["MatchTeamed"] = "You are not allowed to do this while on a deathmatch team.",
-                ["MatchNoMatchesExist"] = "No matches exist. Challenge a player by using <color=orange>/{0} name</color>",
-                ["MatchStarted"] = "Your match is starting versus: <color=yellow>{0}</color>",
+                ["MatchNoMatchesExist"] = "No matches exist. Challenge a player by using <color=#FFA500>/{0} name</color>",
+                ["MatchStarted"] = "Your match is starting versus: <color=#FFFF00>{0}</color>",
+                ["MatchNextRound"] = "Round {0}/{1} is starting versus: <color=#FFFF00>{2}</color>",
                 ["MatchStartedAlready"] = "Your match has already started. You must wait for it to end.",
                 ["MatchPlayerLeft"] = "You have removed yourself from your deathmatch team.",
                 ["MatchCannotChallenge"] = "{0} is already in a match.",
                 ["MatchCannotChallengeAgain"] = "You can only challenge one player at a time.",
-                ["MatchRequested"] = "<color=lime>{0}</color> has requested a deathmatch. Use <color=orange>/{1} accept</color> to accept this challenge.",
-                ["MatchRequestSent"] = "Match request sent to <color=lime>{0}</color>.",
+                ["MatchRequested"] = "<color=#00FF00>{0}</color> has requested a deathmatch. Use <color=#FFA500>/{1} accept</color> to accept this challenge.",
+                ["MatchRequestSent"] = "Match request sent to <color=#00FF00>{0}</color>.",
                 ["MatchNoneRequested"] = "No one has challenged you to a deathmatch yet.",
                 ["MatchPlayerOffline"] = "The player challenging you is no longer online.",
-                ["MatchSizeChanged"] = "Deathmatch changed to <color=yellow>{0}v{0}</color>.",
-                ["MatchOpened"] = "Your deathmatch is now open for private invitation. Friends may use <color=orange>/{0} any</color>, and players may use <color=orange>/{0} {1}</color> to join your team. Use <color=orange>/{0} public</color> to toggle invitations as public or private.",
+                ["MatchSizeChanged"] = "Deathmatch changed to <color=#FFFF00>{0}v{0}</color>.",
+                ["MatchOpened"] = "Your deathmatch is now open for private invitation. Friends may use <color=#FFA500>/{0} any</color>, and players may use <color=#FFA500>/{0} {1}</color> to join your team. Use <color=#FFA500>/{0} public</color> to toggle invitations as public or private.",
                 ["MatchCancelled"] = "{0} has cancelled the deathmatch.",
                 ["MatchNotAHost"] = "You must be a host of a deathmatch to use this command.",
-                ["MatchDoesntExist"] = "You are not in a deathmatch. Challenge a player by using <color=orange>/{0} name</color>.",
+                ["MatchDoesntExist"] = "You are not in a deathmatch. Challenge a player by using <color=#FFA500>/{0} name</color>.",
                 ["MatchSizeSyntax"] = "Invalid syntax, use /{0} size #",
                 ["MatchTeamFull"] = "Team is full ({0} players)",
                 ["MatchJoinedTeam"] = "{0} joined {1} ({2}/{3}). {4} ({5}/{3})",
@@ -7888,11 +9200,11 @@ namespace Oxide.Plugins
                 ["MatchKickBan"] = "<color=#5A397A>/{0} kickban id/name</color><color=#5A625B> • Kickban a player from the match [Host Only]</color>",
                 ["MatchSetCode"] = "<color=#5A397A>/{0} setcode [code]</color><color=#5A625B> • Change or see your code [Host Only]</color>",
                 ["MatchTogglePublic"] = "<color=#5A397A>/{0} public</color><color=#5A625B> • Toggle match as public or private invitation [Host Only]</color>",
-                ["MatchDefeat"] = "<color=silver><color=lime>{0}</color> has defeated <color=lime>{1}</color> in a <color=yellow>{2}v{2}</color> deathmatch!</color>",
-                ["MatchIsNotNaked"] = "Match cannot start because <color=lime>{0}</color> is not naked. Next queue check in 30 seconds.",
+                ["MatchDefeat"] = "<color=#C0C0C0><color=#00FF00>{0}</color> has defeated <color=#00FF00>{1}</color> in a <color=#FFFF00>{2}v{2}</color> deathmatch!</color>",
+                ["MatchIsNotNaked"] = "Match cannot start because <color=#00FF00>{0}</color> is not naked. Next queue check in 30 seconds.",
                 ["MatchCannotBan"] = "You cannot ban this player, or this player is already banned.",
-                ["MatchBannedUser"] = "You have banned <color=lime>{0}</color> from your team.",
-                ["MatchPlayerNotFound"] = "<color=lime>{0}</color> is not on your team.",
+                ["MatchBannedUser"] = "You have banned <color=#00FF00>{0}</color> from your team.",
+                ["MatchPlayerNotFound"] = "<color=#00FF00>{0}</color> is not on your team.",
                 ["MatchCodeIs"] = "Your code is: {0}",
                 ["InQueueList"] = "Players in the queue:",
                 ["HelpTDM"] = "<color=#5A397A>/{0}</color><color=#5A625B> • Create a team deathmatch</color>",
@@ -7903,14 +9215,14 @@ namespace Oxide.Plugins
                 ["MatchPublic"] = "Your match is now open to the public.",
                 ["MatchPrivate"] = "Your match is now private and requires a code, or to be a friend to join.",
                 ["CannotBank"] = "You are not allowed to bank while dueling.",
-                ["TargetMustBeNaked"] = "<color=red>The person you are challenging must be naked before you can challenge them.</color>",
+                ["TargetMustBeNaked"] = "<color=#FF0000>The person you are challenging must be naked before you can challenge them.</color>",
                 ["MatchKit"] = "<color=#5A397A>/{0} kit <name></color><color=#5A625B> • Changes the kit used [Host Only]</color>",
-                ["MatchKitSet"] = "Kit set to: <color=yellow>{0}</color>",
+                ["MatchKitSet"] = "Kit set to: <color=#FFFF00>{0}</color>",
                 ["MatchChallenge0"] = "<color=#5A397A>/{0} <name> [kitname]</color><color=#5A625B> • Challenge another player and set the kit if specified</color>",
-                ["MatchPlayerDefeated"] = "<color=silver><color=lime>{0}</color> was killed by <color=lime>{1}</color> using <color=red>{2}</color> (<color=red>{3}: {4}m</color>)</color>",
+                ["MatchDeathMessage1"] = "<color=#C0C0C0><color=#00FF00>{0}</color> <color=#000000>→</color> <color=#00FF00>{1}</color>: <color=#FFAA00>{2}</color> <color=#FFAA00>{3}: {4}m</color></color>",
+                ["MatchDeathMessage2"] = "<color=#C0C0C0><color=#00FF00>{AttackerName}</color> (<color=#00FF00>W</color>: <color=#FFA500>{AttackerWins}</color> / <color=#FF0000>L</color>: <color=#FFA500>{AttackerLosses}</color>) <color=#000000>→</color> <color=#00FF00>{VictimName}</color> (<color=#00FF00>W</color>: <color=#FFA500>{VictimWins}</color> / <color=#FF0000>L</color>: <color=#FFA500>{VictimLosses}</color>): {Size}v{Size} <color=#FFAA00>{Weapon}</color> <color=#FFAA00>{Distance}m</color></color>",
                 ["CommandNotAllowed"] = "You are not allowed to use this command right now.",
                 ["HelpKit"] = "<color=#5A397A>/{0} kit</color><color=#5A625B> • Pick a kit</color>",
-                ["RemovedXWallsCustom"] = "Removed {0} walls due to the deletion of zones which exceed the Max Zone cap.",
                 ["ZonesSetup"] = "Initialized {0} existing dueling zones.",
                 ["ArenasSetup"] = "{0} existing arenas are now protected.",
                 ["NoPendingRequests2"] = "You have no pending request to accept.",
@@ -7940,15 +9252,550 @@ namespace Oxide.Plugins
                 ["UI_Requeue"] = "Requeue",
                 ["BeginSpectating"] = "You are now spectating.",
                 ["EndSpectating"] = "You are no longer a spectator.",
-                ["UI_ReadyOn"] = "<color=red>Ready On</color>",
+                ["UI_ReadyOn"] = "<color=#FF0000>Ready On</color>",
                 ["UI_ReadyOff"] = "Ready Off",
-                ["SuicideBlock"] = "<color=red>You have suicided or disconnected in a duel and must wait up to 60 seconds to duel again.</color>",
+                ["SuicideBlock"] = "<color=#FF0000>You have suicided or disconnected in a duel and must wait up to 60 seconds to duel again.</color>",
                 ["ZoneRenamed"] = "Zone renamed to {0}",
                 ["ZoneNames"] = "<color=#183a0e>Zone Names ({0}):</color> {1}",
                 ["ZoneRename"] = "/{0} rename <name>",
                 ["ZoneSet"] = "Zone set to: {0}",
                 ["Prefix"] = "[ <color=#406B35>Duelist</color> ]: ",
             }, this);
+        }
+
+        private Configuration config;
+
+        public class Configuration
+        {
+            [JsonProperty(PropertyName = "Advanced Options")]
+            public AdvancedSettings Advanced = new();
+
+            [JsonProperty(PropertyName = "Animals")]
+            public AnimalSettings Animals = new();
+
+            [JsonProperty(PropertyName = "Automatically Power On Devices")]
+            public DeviceSettings Devices = new();
+
+            [JsonProperty(PropertyName = "Betting")]
+            public BetSettings Betting = new();
+
+            [JsonProperty(PropertyName = "Custom Kits")]
+            public CustomKitSettings CustomKits = new();
+
+            [JsonProperty(PropertyName = "Deathmatch")]
+            public DeathmatchSettings Deathmatch = new();
+
+            [JsonProperty(PropertyName = "Deployables")]
+            public DeployableSettings Deployables = new();
+
+            [JsonProperty(PropertyName = "Ranked Ladder")]
+            public RankedSettings Ranked = new();
+
+            [JsonProperty(PropertyName = "Respawn")]
+            public RespawnSettings Respawn = new();
+
+            [JsonProperty(PropertyName = "Rewards")]
+            public RewardSettings Rewards = new();
+
+            [JsonProperty(PropertyName = "Settings")]
+            public PluginSettings Settings = new();
+
+            [JsonProperty(PropertyName = "Spawns")]
+            public SpawnSettings Spawns = new();
+
+            [JsonProperty(PropertyName = "Spectators")]
+            public SpectatorSettings Spectators = new();
+
+            [JsonProperty(PropertyName = "User Interface")]
+            public UserInterfaceSettings UserInterface = new();
+
+            [JsonProperty(PropertyName = "Zone")]
+            public ZoneSettings Zones = new();
+
+            [JsonProperty(PropertyName = "Block paid and restricted content to comply with Facepunch TOS")]
+            public bool BlockPaidContent = true;
+        }
+
+        private void LoadKitSettings()
+        {
+            config.Betting.Load();
+
+            foreach (var kit in config.Settings.Kits)
+            {
+                if (!string.IsNullOrEmpty(kit) && !hpDuelingKits.Contains(kit))
+                {
+                    hpDuelingKits.Add(kit); // 0.1.14 fix
+                    _hpDuelingKits.Add(kit); // 0.1.17 clone for Least Used Chance compatibility
+                }
+            }
+
+            foreach (var kit in config.Settings.lesserKits)
+            {
+                if (!string.IsNullOrEmpty(kit) && !lpDuelingKits.Contains(kit))
+                {
+                    lpDuelingKits.Add(kit); // 0.1.16
+                    _lpDuelingKits.Add(kit); // 0.1.17 clone for Least Used Chance compatibility
+                }
+            }
+        }
+
+        public class CustomKitSettings
+        {
+            [JsonProperty(PropertyName = "Use Workshop Skins")]
+            public bool useWorkshopSkins = true;
+
+            [JsonProperty("Kits", ObjectCreationHandling = ObjectCreationHandling.Replace, DefaultValueHandling = DefaultValueHandling.Populate)]
+
+            public Dictionary<string, List<DuelKitItem>> Kits = new()
+            {
+                ["Hunting Bow"] = new List<DuelKitItem>
+                {
+                    new DuelKitItem(null, 1, "belt", null, "bow.hunting", 0, -1),
+                    new DuelKitItem(null, 50, "belt", null, "arrow.wooden", 0, -1),
+                    new DuelKitItem(null, 1, "belt", null, "spear.stone", 0, -1),
+                    new DuelKitItem(null, 5, "belt", null, "bandage", 0, -1),
+                    new DuelKitItem(null, 5, "belt", null, "syringe.medical", 0, -1),
+                    new DuelKitItem(null, 5, "belt", null, "largemedkit", 0, -1),
+                    new DuelKitItem(null, 1, "wear", null, "burlap.gloves", 0, -1),
+                    new DuelKitItem(null, 1, "wear", null, "burlap.trousers", 0, -1),
+                    new DuelKitItem(null, 1, "wear", null, "burlap.shoes", 0, -1),
+                    new DuelKitItem(null, 1, "wear", null, "burlap.shirt", 0, -1),
+                    new DuelKitItem(null, 1, "wear", null, "burlap.headwrap", 0, -1),
+                },
+                ["Assault Rifle and Bolt Action Rifle"] = new List<DuelKitItem>
+                {
+                    new DuelKitItem("ammo.rifle", 1, "belt", new() { "weapon.mod.lasersight" }, "rifle.ak", 0, -1),
+                    new DuelKitItem(null, 1, "belt", new() { "weapon.mod.lasersight", "weapon.mod.small.scope" }, "rifle.bolt", 0, -1),
+                    new DuelKitItem(null, 5, "belt", null, "bandage", 0, -1),
+                    new DuelKitItem(null, 5, "belt", null, "syringe.medical", 0, -1),
+                    new DuelKitItem(null, 5, "belt", null, "largemedkit", 0, -1),
+                    new DuelKitItem(null, 10, "belt", null, "bearmeat.cooked", 0, -1),
+                    new DuelKitItem(null, 1, "wear", null, "tshirt", 0, -1),
+                    new DuelKitItem(null, 1, "wear", null, "metal.facemask", 0, -1),
+                    new DuelKitItem(null, 1, "wear", null, "metal.plate.torso", 0, -1),
+                    new DuelKitItem(null, 1, "wear", null, "pants", 0, -1),
+                    new DuelKitItem(null, 1, "wear", null, "burlap.gloves", 0, -1),
+                    new DuelKitItem(null, 1, "wear", null, "shoes.boots", 0, -1),
+                    new DuelKitItem(null, 200, "main", null, "ammo.rifle", 0, -1),
+                    new DuelKitItem(null, 1, "main", null, "weapon.mod.flashlight", 0, -1),
+                    new DuelKitItem(null, 1, "main", null, "weapon.mod.small.scope", 0, -1),
+                },
+                ["Semi-Automatic Pistol"] = new List<DuelKitItem>
+                {
+                    new DuelKitItem("ammo.pistol", 1, "belt", new() { "weapon.mod.lasersight" }, "pistol.semiauto", 0, -1),
+                    new DuelKitItem(null, 5, "belt", null, "bandage", 0, -1),
+                    new DuelKitItem(null, 5, "belt", null, "syringe.medical", 0, -1),
+                    new DuelKitItem(null, 5, "belt", null, "largemedkit", 0, -1),
+                    new DuelKitItem(null, 10, "belt", null, "bearmeat.cooked", 0, -1),
+                    new DuelKitItem(null, 1, "wear", null, "tshirt", 0, -1),
+                    new DuelKitItem(null, 1, "wear", null, "metal.facemask", 0, -1),
+                    new DuelKitItem(null, 1, "wear", null, "metal.plate.torso", 0, -1),
+                    new DuelKitItem(null, 1, "wear", null, "pants", 0, -1),
+                    new DuelKitItem(null, 1, "wear", null, "burlap.gloves", 0, -1),
+                    new DuelKitItem(null, 1, "wear", null, "shoes.boots", 0, -1),
+                    new DuelKitItem(null, 200, "main", null, "ammo.pistol", 0, -1),
+                    new DuelKitItem(null, 1, "main", null, "weapon.mod.flashlight", 0, -1),
+                },
+                ["Pump Shotgun"] = new List<DuelKitItem>
+                {
+                    new DuelKitItem("ammo.shotgun.slug", 1, "belt", new() { "weapon.mod.lasersight" }, "shotgun.pump", 0, -1),
+                    new DuelKitItem(null, 5, "belt", null, "bandage", 0, -1),
+                    new DuelKitItem(null, 5, "belt", null, "syringe.medical", 0, -1),
+                    new DuelKitItem(null, 5, "belt", null, "largemedkit", 0, -1),
+                    new DuelKitItem(null, 10, "belt", null, "bearmeat.cooked", 0, -1),
+                    new DuelKitItem(null, 1, "wear", null, "tshirt", 0, -1),
+                    new DuelKitItem(null, 1, "wear", null, "metal.facemask", 0, -1),
+                    new DuelKitItem(null, 1, "wear", null, "metal.plate.torso", 0, -1),
+                    new DuelKitItem(null, 1, "wear", null, "pants", 0, -1),
+                    new DuelKitItem(null, 1, "wear", null, "burlap.gloves", 0, -1),
+                    new DuelKitItem(null, 1, "wear", null, "shoes.boots", 0, -1),
+                    new DuelKitItem(null, 200, "main", null, "ammo.shotgun.slug", 0, -1),
+                    new DuelKitItem(null, 1, "main", null, "weapon.mod.flashlight", 0, -1),
+                }
+            };
+        }
+
+        public class PluginSettings
+        {
+            [JsonProperty(PropertyName = "Allow Announcement")]
+            public bool useAnnouncement = true;
+
+            [JsonProperty(PropertyName = "Announce Duel Information Every X Seconds")]
+            public float announceTime = 1800f;
+
+            [JsonProperty(PropertyName = "Auto Create Dueling Zone If Zone Does Not Exist")]
+            public bool autoSetup = false;
+
+            [JsonProperty(PropertyName = "Auto Enable Dueling If Zone(s) Exist")]
+            public bool autoEnable = true;
+
+            [JsonProperty(PropertyName = "Auto Ready Is Always Enabled")]
+            public bool autoReady = false;
+
+            [JsonProperty(PropertyName = "Auto Wipe Dueling Zones On Map Wipe")]
+            public bool wipeDuelZones = true;
+
+            [JsonProperty(PropertyName = "Blacklist Commands")]
+            public bool useBlacklistCommands = false;
+
+            [JsonProperty(PropertyName = "Blacklisted Chat Commands", ObjectCreationHandling = ObjectCreationHandling.Replace)]
+            public List<string> blacklistCommands = BlacklistedCommands;
+
+            [JsonProperty(PropertyName = "Whitelist Commands")]
+            public bool useWhitelistCommands = false;
+
+            [JsonProperty(PropertyName = "Whitelisted Chat Commands", ObjectCreationHandling = ObjectCreationHandling.Replace)]
+            public List<string> whitelistCommands = WhitelistedCommands;
+
+            [JsonProperty(PropertyName = "Broadcast Defeat To All Players")]
+            public bool broadcastDefeat = true;
+
+            [JsonProperty(PropertyName = "Building Block Extension Radius")]
+            public float buildingBlockExtensionRadius = 30f;
+
+            [JsonProperty(PropertyName = "Ignored Player Items For Naked Check", ObjectCreationHandling = ObjectCreationHandling.Replace)]
+            public List<string> ignoredNakedItems = new() 
+            { 
+                "apple", "apple.spoiled", "bearmeat", "blueberries", "cactusflesh", "can.beans", "can.tuna", "chicken.raw", 
+                "chocolate", "corn", "deermeat.raw", "fish.raw", "granolabar", "grub", "horsemeat.raw", "humanmeat.raw", 
+                "jar.pickle", "meat.boar", "potato", "pumpkin", "seed.corn", "seed.hemp", "seed.pumpkin", "smallwaterbottle", 
+                "waterjug", "wolfmeat.raw", "worm", "rock", "torch", "torch.torch.skull", "divertorch" 
+            };
+
+            [JsonProperty(PropertyName = "Bypass Naked Check And Strip Items Anyway")]
+            public bool bypassNewmans = false;
+
+            [JsonProperty(PropertyName = "Chat SteamID")]
+            public ulong chatSteamID = 0uL;
+
+            [JsonProperty(PropertyName = "Disable Requirement To Allow Duels")]
+            public bool autoAllowAll = false;
+
+            [JsonProperty(PropertyName = "Create Dome Around Event Using Spheres (0 = disabled, recommended = 5)")]
+            public int sphereAmount = 0;
+
+            [JsonProperty(PropertyName = "Duel Command Name")]
+            public string szDuelChatCommand = "duel";
+
+            [JsonProperty(PropertyName = "Queue Command Name")]
+            public string szQueueChatCommand = "queue";
+
+            [JsonProperty(PropertyName = "Immunity Time")]
+            public int immunityTime = 10;
+
+            [JsonProperty(PropertyName = "Kits", ObjectCreationHandling = ObjectCreationHandling.Replace)]
+            public List<string> Kits = DefaultKits;
+
+            [JsonProperty(PropertyName = "Kits Least Used", ObjectCreationHandling = ObjectCreationHandling.Replace)]
+            public List<string> lesserKits = DefaultLesserKits;
+
+            [JsonProperty(PropertyName = "Kits Least Used Chance")]
+            public float lesserKitChance = 0.25f;
+
+            [JsonProperty(PropertyName = "No Stability On Structures")]
+            public bool noStability = true;
+
+            [JsonProperty(PropertyName = "No Movement During Immunity")]
+            public bool noMovement = false;
+
+            [JsonProperty(PropertyName = "Player Health After Duel [0 = disabled]")]
+            public float playerHealth = 100f;
+
+            [JsonProperty(PropertyName = "Prevent Players From Spawning In Zone")]
+            public bool blockSpawning = true;
+
+            [JsonProperty(PropertyName = "Prevent Players Not Dueling From Entering The Zone")]
+            public bool removePlayers;
+
+            [JsonProperty(PropertyName = "Prevent Players Includes Admins")]
+            public bool removeAdmins;
+
+            [JsonProperty(PropertyName = "Prevent Players Includes Noclip")]
+            public bool removeFlying;
+
+            [JsonProperty(PropertyName = "Reset Temporary Ladder Each Wipe")]
+            public bool resetSeed = true;
+
+            [JsonProperty(PropertyName = "Respawn Dead Players On Disconnect")]
+            public bool respawnDeadDisconnect = true;
+
+            [JsonProperty(PropertyName = "Respawn Zone Walls On Death")]
+            public bool respawnWalls = false;
+
+            [JsonProperty(PropertyName = "Scale Damage Percent", NullValueHandling = NullValueHandling.Ignore)]
+            public float? _damageScaleAmount = null;
+
+            [JsonProperty(PropertyName = "Scale Damage Multiplier")]
+            public float damageScaleAmount = 1f;
+
+            [JsonProperty(PropertyName = "Set Preferred Environment Plugin Time")]
+            public bool setPlayerTime = false;
+
+            [JsonProperty(PropertyName = "Use Invisibility")]
+            public bool useInvisibility = true;
+
+            [JsonProperty(PropertyName = "Time To Duel In Minutes Before Death")]
+            public int deathTime = 10;
+
+            [JsonProperty(PropertyName = "Use Random Skins")]
+            public bool useRandomSkins = true;
+        }
+
+        public class AnimalSettings
+        {
+            [JsonProperty(PropertyName = "Die Instantly")]
+            public bool killNpc = false;
+
+            [JsonProperty(PropertyName = "Put To Sleep")]
+            public bool putToSleep = true;
+        }
+
+        public class AdvancedSettings
+        {
+            [JsonProperty(PropertyName = "Let Players Die Normally")]
+            public bool allowPlayerDeaths = false;
+
+            [JsonProperty(PropertyName = "Require 1v1 Maximum Spawn Points To Be Less Than Or Equal To X")]
+            public int requiredMaxSpawns = 200;
+
+            [JsonProperty(PropertyName = "Require 1v1 Minimum Spawn Points To Be Equal Or Greater Than X")]
+            public int requiredMinSpawns = 2;
+
+            [JsonProperty(PropertyName = "Require TDM Minimum Spawn Points To Be Equal Or Greater To The Number Of Players Joining")]
+            public bool requireTeamSize = false;
+
+            [JsonProperty(PropertyName = "Send Dead Players Back Home")]
+            public bool sendDeadHome = true;
+
+            [JsonProperty(PropertyName = "Send Defeated Players Back Home")]
+            public bool sendDefeatedHome = false;
+        }
+
+        public class BetSettings
+        {
+            [JsonProperty(PropertyName = "Allow Bets To Be Forfeit")]
+            public bool allowBetForfeit = true;
+
+            [JsonProperty(PropertyName = "Allow Bets To Be Refunded")]
+            public bool allowBetRefund = false;
+
+            [JsonProperty(PropertyName = "Bets", ObjectCreationHandling = ObjectCreationHandling.Replace)]
+            public List<object> entries = DefaultBets;
+
+            internal List<BetInfo> Bets = new();
+
+            internal void Load()
+            {
+                foreach (var entry in entries)
+                {
+                    Bets.Add(JsonConvert.DeserializeObject<BetInfo>(JsonConvert.SerializeObject(entry)));
+                }
+            }
+
+            [JsonProperty(PropertyName = "Enabled")]
+            public bool allowBets = false;
+        }
+
+        public class DeathmatchSettings
+        {
+            [JsonProperty(PropertyName = "Announce Deaths To Server")]
+            public bool tdmServerDeaths = false;
+
+            [JsonProperty(PropertyName = "Announce Deaths To Match")]
+            public bool tdmMatchDeaths = true;
+
+            [JsonProperty(PropertyName = "Chat Command")]
+            public string szMatchChatCommand = "tdm";
+
+            [JsonProperty(PropertyName = "Enabled")]
+            public bool tdmEnabled = true;
+
+            [JsonProperty(PropertyName = "Friendly Fire")]
+            public bool dmFF = true;
+
+            [JsonProperty(PropertyName = "Rounds per match")]
+            public int Rounds = 3;
+
+            [JsonProperty(PropertyName = "Prioritize closer teams spawns first")]
+            public bool jitteredSpawns = true;
+
+            [JsonProperty(PropertyName = "Min Team Size")]
+            public int minDeathmatchSize = 2;
+
+            [JsonProperty(PropertyName = "Max Team Size")]
+            public int maxDeathmatchSize = 5;
+
+            [JsonProperty(PropertyName = "Evil Shirt Skin")]
+            public ulong teamEvilShirt = 14177;
+
+            [JsonProperty(PropertyName = "Good Shirt Skin")]
+            public ulong teamGoodShirt = 101;
+
+            [JsonProperty(PropertyName = "Shirt Shortname")]
+            public string teamShirt = "tshirt";
+
+            [JsonProperty(PropertyName = "Economics Money [0 = disabled]")]
+            public double teamEconomicsMoney;
+
+            [JsonProperty(PropertyName = "ServerRewards Points [0 = disabled]")]
+            public int teamServerRewardsPoints;
+        }
+
+        public class DeployableSettings
+        {
+            [JsonProperty(PropertyName = "Allowed", ObjectCreationHandling = ObjectCreationHandling.Replace)]
+            public Dictionary<string, bool> Allowed = new();
+
+            [JsonProperty(PropertyName = "Morph Barricades Into High External Stone Walls")]
+            public bool morphBarricadesStoneWalls;
+
+            [JsonProperty(PropertyName = "Morph Barricades Into High External Wooden Walls")]
+            public bool morphBarricadesWoodenWalls;
+        }
+
+        public class DeviceSettings
+        {
+            [JsonProperty(PropertyName = "AutoTurrets")]
+            public bool autoTurrets = false;
+
+            [JsonProperty(PropertyName = "FlameTurrets")]
+            public bool autoFlames = false;
+
+            [JsonProperty(PropertyName = "Ovens")]
+            public bool autoOvens = false;
+        }
+
+        public class RankedSettings
+        {
+            [JsonProperty(PropertyName = "Award Top X Players On Wipe")]
+            public int permsToGive = 3;
+
+            [JsonProperty(PropertyName = "Enabled")]
+            public bool recordStats = true;
+        }
+
+        public class RespawnSettings
+        {
+            [JsonProperty(PropertyName = "Give Kit If Respawn Items Are Empty")]
+            public string autoKitName = "autokit";
+
+            [JsonProperty("Items", ObjectCreationHandling = ObjectCreationHandling.Replace, DefaultValueHandling = DefaultValueHandling.Populate)]
+            public List<DuelKitItem> respawnLoot { get; set; } = new List<DuelKitItem>
+            {
+                new DuelKitItem(null, 1, "belt", null, "rock", 0, -1),
+                new DuelKitItem(null, 1, "belt", null, "torch", 0, -1),
+            };
+        }
+
+        public class RewardSettings
+        {
+            [JsonProperty(PropertyName = "Economics Money [0 = disabled]")]
+            public double economicsMoney;
+
+            [JsonProperty(PropertyName = "ServerRewards Points [0 = disabled]")]
+            public int serverRewardsPoints;
+
+            [JsonProperty(PropertyName = "Payment Required To Duel")]
+            public CustomCostOption requiredDuelPaymentOption = new();
+        }
+
+        public class SpawnSettings
+        {
+            [JsonProperty(PropertyName = "Auto Remove On Zone Removal")]
+            public bool spAutoRemove = false;
+
+            [JsonProperty(PropertyName = "Draw Time")]
+            public float spDrawTime = 30f;
+
+            [JsonProperty(PropertyName = "Remove All Distance")]
+            public float spRemoveAllMaxDistance;
+
+            [JsonProperty(PropertyName = "Remove Distance")]
+            public float spRemoveOneMaxDistance = 10f;
+        }
+
+        public class SpectatorSettings
+        {
+            [JsonProperty(PropertyName = "Send Home If Rematch Times Out")]
+            public bool sendHomeSpectatorWhenRematchTimesOut = false;
+        }
+
+        public class UserInterfaceSettings
+        {
+            [JsonProperty(PropertyName = "Auto Enable GUI For Players")]
+            public bool guiAutoEnable = false;
+
+            [JsonProperty(PropertyName = "Chat Command")]
+            public string szUIChatCommand = "dui";
+
+            [JsonProperty(PropertyName = "Send Spectators Home FirstOrDefault When Clicking Requeue")]
+            public bool sendHomeRequeue = false;
+
+            [JsonProperty(PropertyName = "Show Close Button (X)")]
+            public bool guiUseCloseButton = true;
+
+            [JsonProperty(PropertyName = "Show Defeat Message UI For X Seconds")]
+            public float guiAnnounceUITime = 7.5f;
+
+            [JsonProperty(PropertyName = "Use Cursor")]
+            public bool guiUseCursor = false;
+        }
+
+        public class ZoneSettings
+        {
+            [JsonProperty(PropertyName = "Avoid Creating Automatic Spawn Points In Water")]
+            public bool avoidWaterSpawns = true;
+
+            [JsonProperty(PropertyName = "Create Least Amount Of Walls")]
+            public bool useLeastAmount = false;
+
+            [JsonProperty(PropertyName = "Create New Zone Every X Duels [0 = disabled]")]
+            public int zoneCounter = 10;
+
+            [JsonProperty(PropertyName = "Extra High External Wall Stacks")]
+            public int extraWallStacks = 2;
+
+            [JsonProperty(PropertyName = "Max Zones [Min 1]")]
+            public int zoneAmount = 1;
+
+            [JsonProperty(PropertyName = "Maximum Incline On Hills")]
+            public float maxIncline = 40f;
+
+            [JsonProperty(PropertyName = "Players Per Zone [Multiple Of 2]")]
+            public int playersPerZone = 10;
+
+            [JsonProperty(PropertyName = "Players Visible To Admins")]
+            public bool visibleToAdmins = true;
+
+            [JsonProperty(PropertyName = "Use Arena Wall Generation")]
+            public bool useZoneWalls = true;
+
+            [JsonProperty(PropertyName = "Use Wooden Walls")]
+            public bool zoneUseWoodenWalls = false;
+
+            [JsonProperty(PropertyName = "Zone Radius (Min: 50, Max: 300)")]
+            public float zoneRadius = 50f;
+
+            [JsonProperty(PropertyName = "Allowed Zone Manager Zones", ObjectCreationHandling = ObjectCreationHandling.Replace)]
+            public List<string> Allowed = new();
+        }
+
+        private const bool en = true;
+        public class CustomCostOption
+        {
+            [JsonProperty(PropertyName = en ? "Enabled" : "Включено")] public bool Enabled = true; 
+            [JsonProperty(en ? "Plugin Name" : "Название плагина")] public string PluginName = "Economics";
+            [JsonProperty(en ? "Deposit Method (API)" : "Название метода(API)")] public string DepositHookName = "Deposit";
+            [JsonProperty(en ? "Withdraw Method (API)" : "Метод вывода средств (API)")] public string WithdrawHookName = "Withdraw";
+            [JsonProperty(en ? "Balance Method (API)" : "Метод балансировки (API)")] public string BalanceHookName = "Balance";
+            [JsonProperty("ShoppyStock Shop Name")] public string ShoppyStockShopName = "";
+            [JsonProperty(en ? "Currency Name" : "Название валюты")] public string CurrencyName = "$";
+            [JsonProperty(en ? "Amount" : "Сумма")] public double Amount;
+            [JsonProperty(en ? "Amount Data Type (API) - [ 0 - double | 1 - float | 2 - int ]" : "Тип данных метода(Сумма API) - [ 0 - double | 1 - float | 2 - int ]")] public int AmountDataType;
+            [JsonProperty(en ? "User Data Type (API) - [ 0 - ulong | 1 - string | 2 - player ]" : "Тип данных метода(User API) - [ 0 - ulong | 1 - string | 2 - player ]")] public int PlayerDataType;
+
+            internal Plugin plugin;
+            internal bool IsEnabled() => Enabled && Amount > 0 && !string.IsNullOrWhiteSpace(PluginName) && !string.IsNullOrWhiteSpace(WithdrawHookName) && !string.IsNullOrWhiteSpace(DepositHookName) && !string.IsNullOrWhiteSpace(BalanceHookName);
         }
 
         public List<string> VerifiedKits
@@ -7965,9 +9812,9 @@ namespace Oxide.Plugins
                 if (lpDuelingKits.Count > 0)
                     list.AddRange(lpDuelingKits);
 
-                if (list.Count == 0 && customKits.Count > 0)
+                if (list.Count == 0 && config.CustomKits.Kits.Count > 0)
                 {
-                    list.AddRange(customKits.Select(kvp => kvp.Key));
+                    list.AddRange(config.CustomKits.Kits.Keys);
                 }
 
                 list.Sort();
@@ -7977,335 +9824,153 @@ namespace Oxide.Plugins
 
         public string GetVerifiedKit(string kit)
         {
-            string kits = string.Join(", ", VerifiedKits.ToArray());
+            string kits = string.Join(", ", VerifiedKits);
 
             if (!string.IsNullOrEmpty(kits))
             {
-                if (customKits.Exists(entry => entry.Key.Equals(kit, StringComparison.CurrentCultureIgnoreCase)))
+                foreach (var entry in config.CustomKits.Kits)
                 {
-                    return customKits.FirstOrDefault(entry => entry.Key.Equals(kit, StringComparison.CurrentCultureIgnoreCase)).Key;
+                    if (entry.Key.Equals(kit, StringComparison.CurrentCultureIgnoreCase))
+                    {
+                        return entry.Key;
+                    }
                 }
-                if (hpDuelingKits.Exists(entry => entry.Equals(kit, StringComparison.CurrentCultureIgnoreCase)))
+                foreach (var entry in hpDuelingKits)
                 {
-                    return hpDuelingKits.FirstOrDefault(entry => entry.Equals(kit, StringComparison.CurrentCultureIgnoreCase));
+                    if (entry.Equals(kit, StringComparison.CurrentCultureIgnoreCase))
+                    {
+                        return entry;
+                    }
                 }
-                if (lpDuelingKits.Exists(entry => entry.Equals(kit, StringComparison.CurrentCultureIgnoreCase)))
+                foreach (var entry in lpDuelingKits)
                 {
-                    return lpDuelingKits.FirstOrDefault(entry => entry.Equals(kit, StringComparison.CurrentCultureIgnoreCase));
+                    if (entry.Equals(kit, StringComparison.CurrentCultureIgnoreCase))
+                    {
+                        return entry;
+                    }
                 }
             }
 
             return null;
         }
 
-        private void LoadVariables()
+        private bool isInitialized = true;
+
+        protected override void LoadConfig()
         {
-            LoadAnimalSettings();
-            LoadNormalSettings();
-            LoadDeviceSettings();
-            LoadBetSettings();
-            LoadZoneSettings();
-            LoadDeployableSettings();
-            LoadRankedSettings();
-            LoadKitSettings();
-            LoadRespawnSettings();
-            LoadRewardSettings();
-            LoadSpawnSettings();
-            LoadDeathmatchSettings();
-            LoadAdvancedSettings();
-            LoadUserInterfaceSettings();
-            LoadSpectatorSettings();
-            RegisterCommands();
-            EnsureLimits();
-
-            canSaveConfig = true;
-
-            if (Changed)
+            base.LoadConfig();
+            isInitialized = false;
+            try
             {
-                SaveConfig();
-                Changed = false;
+                config = Config.ReadObject<Configuration>();
+                if (config == null) throw new NullReferenceException("config");
+                isInitialized = true;
             }
+            catch (Exception ex)
+            {
+                LoadDefaultConfig();
+                Puts(ex.ToString());
+            }
+            LoadKitSettings();
+            EnsureLimits();
+            SaveConfig();
         }
-
-        private bool canSaveConfig;
 
         protected override void SaveConfig()
         {
-            if (canSaveConfig)
+            if (isInitialized)
             {
-                base.SaveConfig();
+                Config.WriteObject(config);
             }
-        }
-
-        private void LoadAnimalSettings()
-        {
-            putToSleep = Convert.ToBoolean(GetConfig("Animals", "Put To Sleep", true));
-            killNpc = Convert.ToBoolean(GetConfig("Animals", "Die Instantly", false));
-        }
-
-        private void LoadNormalSettings()
-        {
-            chatSteamID = Convert.ToUInt64(GetConfig("Settings", "Chat SteamID", 0uL));
-            setPlayerTime = Convert.ToBoolean(GetConfig("Settings", "Set Preferred Environment Plugin Time", false));
-            removePlayers = Convert.ToBoolean(GetConfig("Settings", "Prevent Players Not Dueling From Entering The Zone", false));
-            announceTime = Convert.ToSingle(GetConfig("Settings", "Announce Duel Information Every X Seconds", 1800f));
-            wipeDuelZones = Convert.ToBoolean(GetConfig("Settings", "Auto Wipe Dueling Zones On Map Wipe", true));
-            autoSetup = Convert.ToBoolean(GetConfig("Settings", "Auto Create Dueling Zone If Zone Does Not Exist", false));
-            immunityTime = Convert.ToInt32(GetConfig("Settings", "Immunity Time", 10));
-            deathTime = Convert.ToInt32(GetConfig("Settings", "Time To Duel In Minutes Before Death", 10));
-            szDuelChatCommand = Convert.ToString(GetConfig("Settings", "Duel Command Name", "duel"));
-            szQueueChatCommand = Convert.ToString(GetConfig("Settings", "Queue Command Name", "queue"));
-            useAnnouncement = Convert.ToBoolean(GetConfig("Settings", "Allow Announcement", true));
-            broadcastDefeat = Convert.ToBoolean(GetConfig("Settings", "Broadcast Defeat To All Players", true));
-            damageScaleAmount = Convert.ToSingle(GetConfig("Settings", "Scale Damage Percent", 1f));
-            buildingBlockExtensionRadius = Convert.ToSingle(GetConfig("Settings", "Building Block Extension Radius", 30f));
-            autoAllowAll = Convert.ToBoolean(GetConfig("Settings", "Disable Requirement To Allow Duels", false));
-            useRandomSkins = Convert.ToBoolean(GetConfig("Settings", "Use Random Skins", true));
-            playerHealth = Convert.ToSingle(GetConfig("Settings", "Player Health After Duel [0 = disabled]", 100f));
-            autoEnable = Convert.ToBoolean(GetConfig("Settings", "Auto Enable Dueling If Zone(s) Exist", false));
-            bypassNewmans = Convert.ToBoolean(GetConfig("Settings", "Bypass Naked Check And Strip Items Anyway", false));
-            respawnDeadDisconnect = Convert.ToBoolean(GetConfig("Settings", "Respawn Dead Players On Disconnect", true));
-            resetSeed = Convert.ToBoolean(GetConfig("Settings", "Reset Temporary Ladder Each Wipe", true));
-            noStability = Convert.ToBoolean(GetConfig("Settings", "No Stability On Structures", true));
-            noMovement = Convert.ToBoolean(GetConfig("Settings", "No Movement During Immunity", false));
-            respawnWalls = Convert.ToBoolean(GetConfig("Settings", "Respawn Zone Walls On Death", false));
-            sphereAmount = Convert.ToInt32(GetConfig("Settings", "Create Dome Around Event Using Spheres (0 = disabled, recommended = 5)", 0));
-            blockSpawning = Convert.ToBoolean(GetConfig("Settings", "Prevent Players From Spawning In Zone", true));
-            useBlacklistCommands = Convert.ToBoolean(GetConfig("Settings", "Blacklist Commands", false));
-            blacklistCommands = new((GetConfig("Settings", "Blacklisted Chat Commands", BlacklistedCommands) as List<object>).Where(o => o != null && o.ToString().Length > 0).Select(o => o.ToString().ToLower()));
-            useWhitelistCommands = Convert.ToBoolean(GetConfig("Settings", "Whitelist Commands", false));
-            whitelistCommands = new((GetConfig("Settings", "Whitelisted Chat Commands", WhitelistedCommands) as List<object>).Where(o => o != null && o.ToString().Length > 0).Select(o => o.ToString().ToLower()));
-        }
-
-        private void LoadDeviceSettings()
-        {
-            autoOvens = Convert.ToBoolean(GetConfig("Automatically Power On Devices", "Ovens", false));
-            autoFlames = Convert.ToBoolean(GetConfig("Automatically Power On Devices", "FlameTurrets", false));
-            autoTurrets = Convert.ToBoolean(GetConfig("Automatically Power On Devices", "AutoTurrets", false));
-        }
-
-        private void LoadBetSettings()
-        {
-            allowBetForfeit = Convert.ToBoolean(GetConfig("Betting", "Allow Bets To Be Forfeit", true));
-            allowBetRefund = Convert.ToBoolean(GetConfig("Betting", "Allow Bets To Be Refunded", false));
-            allowBets = Convert.ToBoolean(GetConfig("Betting", "Enabled", false));
-
-            SetupBets();
-        }
-
-        private void LoadZoneSettings()
-        {
-            zoneRadius = Convert.ToSingle(GetConfig("Zone", "Zone Radius (Min: 50, Max: 300)", 50f));
-            zoneCounter = Convert.ToInt32(GetConfig("Zone", "Create New Zone Every X Duels [0 = disabled]", 10));
-            maxIncline = Convert.ToSingle(GetConfig("Zone", "Maximum Incline On Hills", 40f));
-            zoneAmount = Convert.ToInt32(GetConfig("Zone", "Max Zones [Min 1]", 1));
-            playersPerZone = Convert.ToInt32(GetConfig("Zone", "Players Per Zone [Multiple Of 2]", 10));
-            visibleToAdmins = Convert.ToBoolean(GetConfig("Zone", "Players Visible To Admins", true));
-            avoidWaterSpawns = Convert.ToBoolean(GetConfig("Zone", "Avoid Creating Automatic Spawn Points In Water", true));
-            extraWallStacks = Convert.ToInt32(GetConfig("Zone", "Extra High External Wall Stacks", 2));
-            useZoneWalls = Convert.ToBoolean(GetConfig("Zone", "Use Arena Wall Generation", true));
-            zoneUseWoodenWalls = Convert.ToBoolean(GetConfig("Zone", "Use Wooden Walls", false));
-            useLeastAmount = Convert.ToBoolean(GetConfig("Zone", "Create Least Amount Of Walls", false));
-        }
-
-        private void LoadDeployableSettings()
-        {
-            morphBarricadesStoneWalls = Convert.ToBoolean(GetConfig("Deployables", "Morph Barricades Into High External Stone Walls", false));
-            morphBarricadesWoodenWalls = Convert.ToBoolean(GetConfig("Deployables", "Morph Barricades Into High External Wooden Walls", false));
-        }
-
-        private void LoadRankedSettings()
-        {
-            recordStats = Convert.ToBoolean(GetConfig("Ranked Ladder", "Enabled", true));
-            permsToGive = Convert.ToInt32(GetConfig("Ranked Ladder", "Award Top X Players On Wipe", 3));
-        }
-
-        private void LoadRespawnSettings()
-        {
-            autoKitName = Convert.ToString(GetConfig("Respawn", "Give Kit If Respawn Items Are Empty", "autokit"));
-            var defaultRespawn = GetConfig("Respawn", "Items", RespawnLoot) as List<object>;
-
-            SetupRespawnItems(defaultRespawn, ref respawnLoot);
-        }
-
-        private void LoadRewardSettings()
-        {
-            economicsMoney = Convert.ToDouble(GetConfig("Rewards", "Economics Money [0 = disabled]", 0.0));
-            serverRewardsPoints = Convert.ToInt32(GetConfig("Rewards", "ServerRewards Points [0 = disabled]", 0));
-            requiredDuelMoney = Convert.ToDouble(GetConfig("Rewards", "Required Money To Duel", 0.0));
-        }
-
-        private void LoadSpawnSettings()
-        {
-            spDrawTime = Convert.ToSingle(GetConfig("Spawns", "Draw Time", 30f));
-            spRemoveOneMaxDistance = Convert.ToSingle(GetConfig("Spawns", "Remove Distance", 10f));
-            spRemoveAllMaxDistance = Convert.ToSingle(GetConfig("Spawns", "Remove All Distance", zoneRadius));
-            //spRemoveInRange = Convert.ToBoolean(GetConfig("Spawns", "Remove In Duel Zone Only", false));
-            spAutoRemove = Convert.ToBoolean(GetConfig("Spawns", "Auto Remove On Zone Removal", false));
-        }
-
-        private void LoadDeathmatchSettings()
-        {
-            dmFF = Convert.ToBoolean(GetConfig("Deathmatch", "Friendly Fire", true));
-            minDeathmatchSize = Convert.ToInt32(GetConfig("Deathmatch", "Min Team Size", 2));
-            maxDeathmatchSize = Convert.ToInt32(GetConfig("Deathmatch", "Max Team Size", 5));
-            teamEvilShirt = Convert.ToUInt64(GetConfig("Deathmatch", "Evil Shirt Skin", 14177));
-            teamGoodShirt = Convert.ToUInt64(GetConfig("Deathmatch", "Good Shirt Skin", 101));
-            teamShirt = Convert.ToString(GetConfig("Deathmatch", "Shirt Shortname", "tshirt"));
-            teamEconomicsMoney = Convert.ToDouble(GetConfig("Deathmatch", "Economics Money [0 = disabled]", 0.0));
-            teamServerRewardsPoints = Convert.ToInt32(GetConfig("Deathmatch", "ServerRewards Points [0 = disabled]", 0));
-            tdmEnabled = Convert.ToBoolean(GetConfig("Deathmatch", "Enabled", true));
-            szMatchChatCommand = Convert.ToString(GetConfig("Deathmatch", "Chat Command", "tdm"));
-            tdmServerDeaths = Convert.ToBoolean(GetConfig("Deathmatch", "Announce Deaths To Server", false));
-            tdmMatchDeaths = Convert.ToBoolean(GetConfig("Deathmatch", "Announce Deaths To Match", true));
-        }
-
-        private void LoadAdvancedSettings()
-        {
-            requireTeamSize = Convert.ToBoolean(GetConfig("Advanced Options", "Require TDM Minimum Spawn Points To Be Equal Or Greater To The Number Of Players Joining", false));
-            requiredMinSpawns = Convert.ToInt32(GetConfig("Advanced Options", "Require 1v1 Minimum Spawn Points To Be Equal Or Greater Than X", 2));
-            requiredMaxSpawns = Convert.ToInt32(GetConfig("Advanced Options", "Require 1v1 Maximum Spawn Points To Be Less Than Or Equal To X", 200));
-            allowPlayerDeaths = Convert.ToBoolean(GetConfig("Advanced Options", "Let Players Die Normally", false));
-            sendDeadHome = Convert.ToBoolean(GetConfig("Advanced Options", "Send Dead Players Back Home", true));
-            sendDefeatedHome = Convert.ToBoolean(GetConfig("Advanced Options", "Send Defeated Players Back Home", false));
-        }
-
-        private void LoadUserInterfaceSettings()
-        {
-            guiAutoEnable = Convert.ToBoolean(GetConfig("User Interface", "Auto Enable GUI For Players", false));
-            szUIChatCommand = Convert.ToString(GetConfig("User Interface", "Chat Command", "dui"));
-            guiUseCursor = Convert.ToBoolean(GetConfig("User Interface", "Use Cursor", false));
-            guiUseCloseButton = Convert.ToBoolean(GetConfig("User Interface", "Show Close Button (X)", true));
-            guiAnnounceUITime = Convert.ToSingle(GetConfig("User Interface", "Show Defeat Message UI For X Seconds", 7.5f));
-            sendHomeRequeue = Convert.ToBoolean(GetConfig("User Interface", "Send Spectators Home FirstOrDefault When Clicking Requeue", false));
-        }
-
-        private void LoadSpectatorSettings()
-        {
-            sendHomeSpectatorWhenRematchTimesOut = Convert.ToBoolean(GetConfig("Spectators", "Send Home If Rematch Times Out", false));
         }
 
         private void RegisterCommands()
         {
-            if (!permission.PermissionExists(duelistPerm)) // prevent warning
-                permission.RegisterPermission(duelistPerm, this);
+            if (recordStats)
+            {
+                if (!permission.PermissionExists(duelistPerm)) // prevent warning
+                    permission.RegisterPermission(duelistPerm, this);
 
-            permission.CreateGroup(duelistGroup, duelistGroup, 0);
-            permission.GrantGroupPermission(duelistGroup, duelistPerm, this);
+                permission.CreateGroup(duelistGroup, duelistGroup, 0);
+                permission.GrantGroupPermission(duelistGroup, duelistPerm, this);
+            }
 
             AddCovalenceCommand("duelist", nameof(CommandDuelist));
 
-            if (!string.IsNullOrEmpty(szDuelChatCommand))
+            if (!string.IsNullOrEmpty(config.Settings.szDuelChatCommand))
             {
-                cmd.AddChatCommand(szDuelChatCommand, this, cmdDuel);
-                cmd.AddConsoleCommand(szDuelChatCommand, this, nameof(ccmdDuel));
-                whitelistCommands.Add(szDuelChatCommand.ToLower());
+                AddCovalenceCommand(config.Settings.szDuelChatCommand, nameof(CommandDuelist));
+                whitelistCommands.Add(config.Settings.szDuelChatCommand.ToLower());
             }
 
-            if (!string.IsNullOrEmpty(szQueueChatCommand))
-                cmd.AddChatCommand(szQueueChatCommand, this, cmdQueue);
-
-            if (tdmEnabled && !string.IsNullOrEmpty(szMatchChatCommand))
+            if (!string.IsNullOrEmpty(config.Settings.szQueueChatCommand))
             {
-                cmd.AddChatCommand(szMatchChatCommand, this, cmdTDM);
-                whitelistCommands.Add(szMatchChatCommand.ToLower());
+                AddCovalenceCommand(config.Settings.szQueueChatCommand, nameof(CommandQueue));
+                whitelistCommands.Add(config.Settings.szQueueChatCommand.ToLower());
             }
 
-            if (!string.IsNullOrEmpty(szUIChatCommand))
+            if (config.Deathmatch.tdmEnabled && !string.IsNullOrEmpty(config.Deathmatch.szMatchChatCommand))
             {
-                cmd.AddChatCommand(szUIChatCommand, this, cmdDUI);
-                cmd.AddConsoleCommand(szUIChatCommand, this, nameof(ccmdDUI));
-            }
-        }
-
-        private void SetupBets()
-        {
-            var bets = GetConfig("Betting", "Bets", DefaultBets) as List<object>;
-
-            foreach (var bet in bets)
-            {
-                duelingBets.Add(JsonConvert.DeserializeObject<BetInfo>(JsonConvert.SerializeObject(bet)));
-            }
-        }
-
-        private void LoadKitSettings()
-        {
-            var kits = GetConfig("Settings", "Kits", DefaultKits) as List<object>;
-
-            if (kits != null && kits.Count > 0)
-            {
-                foreach (object obj in kits)
-                {
-                    var kit = Convert.ToString(obj);
-
-                    if (!string.IsNullOrEmpty(kit) && !hpDuelingKits.Contains(kit))
-                    {
-                        hpDuelingKits.Add(kit); // 0.1.14 fix
-                        _hpDuelingKits.Add(kit); // 0.1.17 clone for Least Used Chance compatibility
-                    }
-                }
+                AddCovalenceCommand(config.Deathmatch.szMatchChatCommand, nameof(CommandDeathmatch));
+                whitelistCommands.Add(config.Deathmatch.szMatchChatCommand.ToLower());
             }
 
-            lesserKitChance = Convert.ToSingle(GetConfig("Settings", "Kits Least Used Chance", 0.25f));
-
-            var lesserKits = GetConfig("Settings", "Kits Least Used", DefaultLesserKits) as List<object>;
-
-            foreach (object obj in lesserKits)
+            if (!string.IsNullOrEmpty(config.UserInterface.szUIChatCommand))
             {
-                var kit = Convert.ToString(obj);
-
-                if (!string.IsNullOrEmpty(kit) && !lpDuelingKits.Contains(kit))
-                {
-                    lpDuelingKits.Add(kit); // 0.1.16
-                    _lpDuelingKits.Add(kit); // 0.1.17 clone for Least Used Chance compatibility
-                }
+                cmd.AddChatCommand(config.UserInterface.szUIChatCommand, this, cmdDUI);
+                cmd.AddConsoleCommand(config.UserInterface.szUIChatCommand, this, nameof(ccmdDUI));
             }
-
-            useWorkshopSkins = Convert.ToBoolean(GetConfig("Custom Kits", "Use Workshop Skins", true));
-
-            var defaultKits = GetConfig("Custom Kits", "Kits", DefaultCustomKits) as Dictionary<string, object>;
-
-            SetupCustomKits(defaultKits, ref customKits);
         }
 
         private void EnsureLimits()
         {
-            if (buildingBlockExtensionRadius < 20f)
-                buildingBlockExtensionRadius = 20f;
+            if (config.Settings.buildingBlockExtensionRadius < 20f)
+                config.Settings.buildingBlockExtensionRadius = 20f;
 
-            if (zoneAmount < 1)
-                zoneAmount = 1;
+            if (config.Zones.zoneAmount < 1)
+                config.Zones.zoneAmount = 1;
 
-            if (zoneRadius < 50f)
-                zoneRadius = 50f;
+            if (config.Zones.playersPerZone < 2)
+                config.Zones.playersPerZone = 2;
+            else if (config.Zones.playersPerZone % 2 != 0)
+                config.Zones.playersPerZone++;
 
-            if (zoneRadius > 300f)
-                zoneRadius = 300f;
+            if (config.Settings.immunityTime < 0)
+                config.Settings.immunityTime = 0;
 
-            if (playersPerZone < 2)
-                playersPerZone = 2;
-            else if (playersPerZone % 2 != 0)
-                playersPerZone++;
+            if (config.Zones.zoneRadius < 50f)
+                config.Zones.zoneRadius = 50f;
+            else if (config.Zones.zoneRadius > 300f)
+                config.Zones.zoneRadius = 300f;
 
-            if (immunityTime < 0)
-                immunityTime = 0;
+            if (config.Advanced.requiredMinSpawns < 2)
+                config.Advanced.requiredMinSpawns = 2;
 
-            if (requiredMinSpawns < 2)
-                requiredMinSpawns = 2;
+            if (config.Advanced.requiredMaxSpawns < 2)
+                config.Advanced.requiredMaxSpawns = 2;
 
-            if (requiredMaxSpawns < 2)
-                requiredMaxSpawns = 2;
+            if (config.UserInterface.guiAnnounceUITime < 1f)
+                config.UserInterface.guiAnnounceUITime = 1f;
 
-            if (guiAnnounceUITime < 1f)
-                guiAnnounceUITime = 1f;
+            if (config.Settings._damageScaleAmount != null)
+            {
+                config.Settings.damageScaleAmount = config.Settings._damageScaleAmount.Value;
+                config.Settings._damageScaleAmount = null;
+            }
+
+            whitelistCommands.AddRange(config.Settings.whitelistCommands);
         }
 
         private void SetupDefinitions()
         {
-            foreach (var itemDef in ItemManager.GetItemDefinitions())
+            if (!isInitialized) return;
+            using var newlyAdded = GetPooledList<string>();
+            using var defs = GetPooledList<ItemDefinition>();
+            defs.AddRange(ItemManager.GetItemDefinitions());
+            defs.Sort((a, b) => string.Compare(a.displayName.english, b.displayName.english, StringComparison.Ordinal));
+            foreach (var itemDef in defs)
             {
                 var mod = itemDef.GetComponent<ItemModDeployable>();
-
                 if (mod == null)
                 {
                     continue;
@@ -8317,63 +9982,28 @@ namespace Oxide.Plugins
 
                 if (externalWall || barricade || isLadder)
                 {
-                    bool value = Convert.ToBoolean(GetConfig("Deployables", string.Format("Allow {0}", itemDef.displayName.translated), false));
-
-                    if (!value)
-                        continue;
-
-                    deployables[itemDef.displayName.translated] = value;
-                    prefabs[mod.entityPrefab.resourcePath] = itemDef.displayName.translated;
+                    if (config.Deployables.Allowed.TryAdd(itemDef.displayName.english, true))
+                    {
+                        newlyAdded.Add(itemDef.displayName.english);
+                    }
                 }
+
+                prefabs[mod.entityPrefab.resourcePath] = itemDef.displayName.translated;
             }
-            if (Changed)
+            if (newlyAdded.Count > 0)
             {
+                Puts("Configuration file has been updated with: {0}", string.Join(", ", newlyAdded));
                 SaveConfig();
-            }
-        }
-
-        private void SetupRespawnItems(List<object> list, ref List<DuelKitItem> source)
-        {
-            foreach (var entry in list)
-            {
-                source.Add(JsonConvert.DeserializeObject<DuelKitItem>(JsonConvert.SerializeObject(entry)));
-            }
-        }
-
-        private void SetupCustomKits(Dictionary<string, object> dict, ref Dictionary<string, List<DuelKitItem>> source)
-        {
-            foreach (var entry in dict)
-            {
-                source[entry.Key] = JsonConvert.DeserializeObject<List<DuelKitItem>>(JsonConvert.SerializeObject(entry.Value));
             }
         }
 
         protected override void LoadDefaultConfig()
         {
             PrintWarning("Creating a new configuration file");
-            Config.Clear();
-            LoadVariables();
+            config = new();
         }
 
-        private object GetConfig(string menu, string datavalue, object defaultValue)
-        {
-            var data = Config[menu] as Dictionary<string, object>;
-            if (data == null)
-            {
-                data = new();
-                Config[menu] = data;
-                Changed = true;
-            }
-            if (!data.TryGetValue(datavalue, out var value))
-            {
-                value = defaultValue;
-                data[datavalue] = value;
-                Changed = true;
-            }
-            return value;
-        }
-
-        private Dictionary<string, string> hexColors = new()
+        private Dictionary<string, string> hexColors = new Dictionary<string, string>
         {
             ["<color=blue>"] = "<color=#0000FF>",
             ["<color=red>"] = "<color=#FF0000>",
@@ -8388,36 +10018,78 @@ namespace Oxide.Plugins
 
         private string msg(string key, string id = null, params object[] args)
         {
-            var sb = new System.Text.StringBuilder(id == null ? RemoveFormatting(lang.GetMessage(key, this, id)) : lang.GetMessage(key, this, id));
-            var str = sb.ToString();
+            using var sb = DisposableBuilder.Get();
 
-            foreach (var entry in hexColors)
+            if (id == null)
             {
-                if (str.Contains(entry.Key))
-                {
-                    sb.Replace(entry.Key, entry.Value);
-                }
+                sb.Append(RemoveFormatting(lang.GetMessage(key, this, id)));
+            }
+            else sb.Append(lang.GetMessage(key, this, id));
+
+            if (sb.Length == 0)
+            {
+                return string.Empty;
+            }
+
+            foreach (var pair in hexColors)
+            {
+                sb.Replace(pair.Key, pair.Value);
             }
 
             return args.Length > 0 ? string.Format(sb.ToString(), args) : sb.ToString();
         }
 
+        public Regex TagRegex = new("<.*?>", RegexOptions.Compiled);
         public string RemoveFormatting(string source)
         {
-            return source.Contains('>') ? Regex.Replace(source, "<.*?>", string.Empty) : source;
+            return source.Contains('>') ? TagRegex.Replace(source, string.Empty) : source;
         }
 
-        public static void Message(BasePlayer player, string message)
-        {
-            Instance.Player.Message(player, message, Instance.chatSteamID);
-        }
-
-        public void Message(HashSet<BasePlayer> players, string key, params object[] args)
+        public void MessageAll(IEnumerable<BasePlayer> players, string key, params object[] args)
         {
             foreach (var player in players)
             {
                 if (IsNotConnected(player)) continue;
-                Message(player, msg(key, player.UserIDString, args ?? Array.Empty<string>()));
+                Player.Message(player, msg(key, player.UserIDString, args), chatSteamID);
+            }
+        }
+
+        public void Message(BasePlayer player, string key, params object[] args)
+        {
+            if (player != null && key != null)
+            {
+                if (player.IsConnected) Player.Message(player, msg(key, player.UserIDString, args), chatSteamID);
+                //if (player is DuelistNPC) Puts(msg(key, player.UserIDString, args));
+            }
+        }
+
+        public void Message(IPlayer user, string key, params object[] args)
+        {
+            if (user.Object is BasePlayer player)
+            {
+                Message(player, key, args);
+            }
+            else user.Reply(msg(key, user.Id, args));
+        }
+
+        public void MessageB(BasePlayer player, string message)
+        {
+            if (player != null && player.IsConnected)
+            {
+                Player.Message(player, message, chatSteamID);
+            }
+        }
+
+        protected static void Puts(Exception ex)
+        {
+            Interface.Oxide.LogInfo("[{0}] {1}", "Duelist", ex);
+        }
+
+        protected new static void Puts(string format, params object[] args)
+        {
+            if (!string.IsNullOrWhiteSpace(format))
+            {
+                Interface.Oxide.LogInfo("[{0}] {1}", "Duelist", (args.Length != 0) ? string.Format(format, args) : format);
             }
         }
 
@@ -8429,22 +10101,39 @@ namespace Oxide.Plugins.DuelistExtensionMethods
 {
     public static class ExtensionMethods
     {
+        public class DisposableBuilder : IDisposable, Pool.IPooled
+        {
+            private StringBuilder _builder;
+            public DisposableBuilder() { }
+            public void LeavePool() => _builder = Pool.Get<StringBuilder>();
+            public void EnterPool() => Pool.FreeUnmanaged(ref _builder);
+            public void Dispose() { DisposableBuilder obj = this; Pool.Free(ref obj); }
+            public static DisposableBuilder Get() => Pool.Get<DisposableBuilder>();
+            public DisposableBuilder Append(string value) { _builder.Append(value); return this; }
+            public DisposableBuilder Replace(string oldValue, string newValue) { _builder.Replace(oldValue, newValue); return this; }
+            public override string ToString() => _builder.ToString();
+            public int Length { get => _builder.Length; set => _builder.Length = value; }
+        }
+        public static void RemoveWhere<K, V>(this Dictionary<K, V> a, Func<K, V, bool> b) { using var c = Facepunch.Pool.Get<PooledList<K>>(); foreach (var d in a) { if (b(d.Key, d.Value)) c.Add(d.Key); } foreach (var e in c) a.Remove(e); }
+        public static void RemoveWhere<TKey, TValue>(this Dictionary<TKey, TValue> a, Func<TKey, bool> b) => RemoveWhere(a, (key, val) => b(key));
+        public static void RemoveWhere<TKey, TValue>(this Dictionary<TKey, TValue> a, Func<TValue, bool> b) => RemoveWhere(a, (key, val) => b(val));
         public static bool All<T>(this IEnumerable<T> a, Func<T, bool> b) { using (var c = a.GetEnumerator()) { while (c.MoveNext()) { if (!b(c.Current)) { return false; } } } return true; }
         public static T ElementAt<T>(this IEnumerable<T> a, int b) { using (var c = a.GetEnumerator()) { while (c.MoveNext()) { if (b == 0) { return c.Current; } b--; } } return default(T); }
         public static bool Exists<T>(this IEnumerable<T> a, Func<T, bool> b = null) { using var c = a.GetEnumerator(); while (c.MoveNext()) { if (b == null || b(c.Current)) { return true; } } return false; }
         public static T FirstOrDefault<T>(this IEnumerable<T> a, Func<T, bool> b = null) { using var c = a.GetEnumerator(); while (c.MoveNext()) { if (b == null || b(c.Current)) { return c.Current; } } return default; }
         public static int Count<T>(this IEnumerable<T> a, Func<T, bool> b = null) { int c = 0; foreach (T d in a) { if (b == null || b(d)) { c++; } } return c; }
-        //public static IEnumerable<T> Select<Y, T>(this IList<Y> a, Func<Y, T> b) { var c = new List<T>(); for (int i = 0; i < a.Count; i++) { c.Add(b(a[i])); } return c; }
         public static IEnumerable<T> Select<Y, T>(this IList<Y> a, Func<Y, T> b) { for (int i = 0; i < a.Count; i++) { yield return b(a[i]); } }
         public static string[] Skip(this string[] a, int b) { if (a.Length == 0) { return Array.Empty<string>(); } string[] c = new string[a.Length - b]; int n = 0; for (int i = 0; i < a.Length; i++) { if (i < b) continue; c[n] = a[i]; n++; } return c; }
-        //public static IEnumerable<V> Select<T, V>(this IEnumerable<T> a, Func<T, V> b) { var c = new List<V>(); using (var d = a.GetEnumerator()) { while (d.MoveNext()) { c.Add(b(d.Current)); } } return c; }
         public static IEnumerable<V> Select<T, V>(this IEnumerable<T> a, Func<T, V> b) { using var c = a.GetEnumerator(); while (c.MoveNext()) { yield return b(c.Current); } }
         public static IEnumerable<T> Take<T>(this IEnumerable<T> a, int b) { if (a == null) yield break; int i = 0; foreach (T c in a) { if (i++ < b) yield return c; else break; } }
-        //public static IEnumerable<T> Where<T>(this IEnumerable<T> a, Func<T, bool> b) { var c = new List<T>(); using (var d = a.GetEnumerator()) { while (d.MoveNext()) { if (b(d.Current)) { c.Add(d.Current); } } } return c; }
         public static IEnumerable<T> Where<T>(this IEnumerable<T> a, Func<T, bool> b) { using var c = a.GetEnumerator(); while (c.MoveNext()) { if (b(c.Current)) yield return c.Current; } }
+        public static List<T> ToList<T>(this IEnumerable<T> a) => new(a);
+        public static string ObjectName(this Collider collider) { try { return collider.name ?? string.Empty; } catch { return string.Empty; } }
         public static bool IsHuman(this BasePlayer a) => a != null && a.userID.IsSteamId();
+        public static bool IsNullOrEmpty<T>(this IReadOnlyCollection<T> c) => c == null || c.Count == 0; 
         public static int Sum<T>(this IEnumerable<T> a, Func<T, int> b) { int c = 0; foreach (T d in a) { c += b(d); } return c; }
         public static bool IsKilled(this BaseNetworkable a) => a == null || a.IsDestroyed || !a.IsFullySpawned();
+        public static void DelayedSafeKill(this BaseNetworkable a) { if (!a.IsKilled()) a.Invoke(a.SafelyKill, 0.0625f); }
         public static void SafelyKill(this BaseNetworkable a) { if (a == null || a.IsDestroyed) { return; } a.Kill(BaseNetworkable.DestroyMode.None); }
         public static bool CanCall(this Plugin a) { return a != null && a.IsLoaded; }
     }
